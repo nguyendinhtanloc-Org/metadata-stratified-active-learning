@@ -18,7 +18,7 @@ class YOLOTrainer:
     def __init__ (
         self,
         model_name: str = "yolov8n",
-        device: str = "cuda",
+        device = 0,
         project_dir: str = "experiments/runs"
     ):
         """
@@ -50,12 +50,6 @@ class YOLOTrainer:
         else:
             # Load pretrained model
             self.model = YOLO(f"{self.model_name}.pt")
-
-        # set device
-        if self.device == "cuda" and self._check_cuda():
-            self.model.to("cuda")
-        else:
-            self.model.to("cpu")
 
     def _check_cuda(self) -> bool:
         """Kiểm tra CUDA có khả dụng không."""
