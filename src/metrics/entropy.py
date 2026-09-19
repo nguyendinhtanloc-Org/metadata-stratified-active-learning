@@ -4,7 +4,7 @@ Metric tính Shannon Entropy cho metadata stratification.
 """
 
 import math
-from json import Counter
+from collections import Counter
 
 def calc_entropy(counter):
     """
