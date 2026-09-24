@@ -117,21 +117,20 @@ def stratified_sampling(
     selected_indices = []
 
     for stratum_key, n_to_select in allocation.items():
-        stratum_indicies = strata[stratum_key]
+        stratum_indices = strata[stratum_key]
 
-        if n_to_select >= len(stratum_indicies):
-            # nếu cần chọn nhiều hơn số ảnh trong stratum
-            selected_indices.extend(stratum_indicies)
+        # Sort theo uncertainty GIẢM DẦN trước (LUÔN LUÔN sort)
+        sorted_indices = sorted(
+            stratum_indices,
+            key=lambda idx: uncertainty_scores.get(idx, 0.0),
+            reverse=True  # Uncertainty CAO nhất lên đầu
+        )
+
+        # Sau đó lấy top N
+        if n_to_select >= len(stratum_indices):
+            selected_indices.extend(stratum_indices)  # Lấy tất cả
         else:
-            # sort stratum indicies theo uncertainty scores theo chiều giảm dần
-            sorted_indicies = sorted(
-                stratum_indicies,
-                key = lambda idx: uncertainty_scores.get(idx, 0.0),
-                reverse=True # Uncertainty CAO nhất lên đầu
-            )
-
-            # lấy top N
-            selected_indices.extend(sorted_indicies[:n_to_select])
+            selected_indices.extend(sorted_indices[:n_to_select])  # Lấy top N đã sort
 
     return selected_indices
 

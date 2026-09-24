@@ -77,14 +77,9 @@ def rank_by_uncertainty(
     
     # Predict từng ảnh với stream=True (nhanh hơn)
     for image_path in image_paths:
-        result = model.predict(
-            source=str(image_path), 
-            verbose=False,
-            stream=True  # Streaming mode
-        )[0]  # Lấy result đầu tiên
-        
-        uncertainty = calc_image_uncertainty(result, num_classes)
-        results_with_paths.append((str(image_path), uncertainty))
+        for result in model.predict(source=str(image_path), verbose=False, stream=True):
+            uncertainty = calc_image_uncertainty(result, num_classes)
+            results_with_paths.append((str(image_path), uncertainty))
     
     # Sắp xếp giảm dần theo uncertainty (uncertainty CAO nhất lên đầu)
     results_with_paths.sort(key=lambda x: x[1], reverse=True)

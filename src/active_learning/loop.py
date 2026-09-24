@@ -10,11 +10,12 @@ from datetime import datetime
 from random import sample
 import random
 import pickle
+import math
 
 from sampling.uncertainty import calc_image_uncertainty
 from sampling.stratified import stratified_sampling, calculate_batch_diversity
 from training.trainer import YOLOTrainer
-from data.loader import get_all_metadata
+from data.loader import get_all_metadata, labels_to_yolo_lines
 from metrics.entropy import calc_batch_entropy
 
 class ActiveLearningLoop:
@@ -58,17 +59,19 @@ class ActiveLearningLoop:
         self.unlabeled_indices = set()
         self.all_metadata = []
         self.history = []
+        self.metadata_path = None
 
     def initialize(self, metadata_path: str, image_dir: str):
         """
         Khởi tạo: Load metadata và chọn initial batch.
-        
+
         Args:
             metadata_path: Đường dẫn đến annotations JSON
             image_dir: Thư mục chứa ảnh
         """
 
         random.seed(self.seed)
+        self.metadata_path = metadata_path
 
         print(f"[INIT] Loading metadata from {metadata_path}...")
 
@@ -106,10 +109,10 @@ class ActiveLearningLoop:
     def train_round(self, round_num: int) -> Dict:
         """
         Train model trên labeled data của round hiện tại.
-        
+
         Args:
             round_num: Số thứ tự round
-        
+
         Returns:
             Dict chứa training metrics
         """
@@ -118,19 +121,22 @@ class ActiveLearningLoop:
         print(f"[ROUND {round_num}] Labeled samples: {len(self.labeled_indices)}")
 
         # lấy danh sách đã label
-        labeled_images = [
-            str(self.image_dir / self.all_metadata[i]["filename"])
-            for i in self.labeled_indices
-            if (self.image_dir / self.all_metadata[i]["filename"]).exists()
-        ]
+        labeled_images = []
+        labeled_metadata = []
+
+        for i in self.labeled_indices:
+            image_path = self.image_dir / self.all_metadata[i]["filename"]
+            if image_path.exists():
+                labeled_images.append(str(image_path))
+                labeled_metadata.append(self.all_metadata[i])
 
         if len(labeled_images) == 0:
             raise ValueError("Không có ảnh nào để train!")
 
-        # Prepare dataset
-        dataset_yaml = self.trainer.prepare_dataset(
+        # Prepare dataset - truyền labels từ metadata thay vì đọc từ file
+        dataset_yaml = self.trainer.prepare_dataset_with_metadata(
             image_paths = labeled_images,
-            labels_dir = str(self.image_dir / "labels"),
+            metadata_list = labeled_metadata,
             output_dir = f"data/processed/{self.experiment_name}/round_{round_num}"
         )
 
@@ -179,8 +185,22 @@ class ActiveLearningLoop:
                continue
 
             try:
-                result = self.trainer.predict(str(image_path), verbose=False)[0]
-                uncertainty_scores[idx] = calc_image_uncertainty(result, self.num_classes)
+                result = self.trainer.predict(str(image_path), verbose=False)
+                if result is None:
+                    # Model không predict được → uncertainty cao nhất
+                    uncertainty_scores[idx] = math.log2(self.num_classes)
+                else:
+                    # Lấy result đầu tiên (nếu là list)
+                    if isinstance(result, list):
+                        result = result[0]
+                    uncertainty_scores[idx] = calc_image_uncertainty(result, self.num_classes)
+            except FileNotFoundError:
+                print(f"[WARNING] Image not found: {image_path}")
+                uncertainty_scores[idx] = 0.0
+            except RuntimeError as e:
+                # CUDA OOM hoặc lỗi nghiêm trọng
+                print(f"[ERROR] Runtime error predicting {image_path}: {e}")
+                raise  # Re-raise để không continue âm thầm
             except Exception as e:
                 print(f"[WARNING] Failed to predict {image_path}: {e}")
                 uncertainty_scores[idx] = 0.0
@@ -238,10 +258,17 @@ class ActiveLearningLoop:
 
         # Kiểm tra checkpoint có tồn tại không
         checkpoint_path = f"checkpoints/{self.experiment_name}.pkl"
+        start_round = 0
+
         if Path(checkpoint_path).exists():
             print(f"[INFO] Found checkpoint, loading...")
             self.load_checkpoint(checkpoint_path)
             print(f"[INFO] Resumed with {len(self.labeled_indices)} labeled samples")
+    
+            # Xác định round bắt đầu từ checkpoint
+            if self.history:
+                start_round = self.history[-1]["round"] + 1
+                print(f"[INFO] Resuming from round {start_round}")
         else:
             self.initialize(metadata_path, image_dir)
 
@@ -251,19 +278,21 @@ class ActiveLearningLoop:
         print(f"{'='*50}")
 
         # initial training
-        round_num = 0
-        train_results = self.train_round(round_num)
-
-        self.history.append({
-            "round": round_num,
-            "labeled_count": len(self.labeled_indices),
-            "map50": train_results.get("map50", 0.0),
-            "map50_95": train_results.get("map50_95", 0.0),
-            "batch_diversity": {}
-        })
+        # Chỉ train và log nếu bắt đầu mới hoàn toàn
+        if start_round == 0:
+            round_num = 0
+            train_results = self.train_round(round_num)
+            
+            self.history.append({
+                "round": round_num,
+                "labeled_count": len(self.labeled_indices),
+                "map50": train_results.get("map50", 0.0),
+                "map50_95": train_results.get("map50_95", 0.0),
+                "batch_diversity": {}
+            })
 
         # main loop
-        for round_num in range(1, self.num_rounds + 1):
+        for round_num in range(start_round + 1, self.num_rounds + 1):
             print(f"\n{'='*50}")
             print(f"ROUND {round_num}/{self.num_rounds}")
             print(f"{'='*50}")
