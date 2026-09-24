@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from active_learning.loop import ActiveLearningLoop
+from sampling.baseline import baseline_sampling
 from utils.config import DEFAULT_CONFIG
 
 def run_experiment(
@@ -25,10 +26,10 @@ def run_experiment(
 ):
     """
     Chạy experiment với config chỉ định.
-    
+
     Args:
         experiment_name: Tên experiment
-        pipeline: "stratified" hoặc "baseline" (random)
+        pipeline: "stratified" hoặc "baseline"
         num_rounds: Số vòng AL
         batch_size: Số ảnh thêm mỗi vòng
         initial_budget: Số ảnh ban đầu
@@ -57,9 +58,15 @@ def run_experiment(
     print(f"Device: {device}")
     print(f"=" * 50)
 
+    # Monkey-patch stratified_sampling nếu là baseline
+    if pipeline == "baseline":
+        import active_learning.loop as loop_module
+        loop_module.stratified_sampling = baseline_sampling
+        print("[INFO] Using baseline (uncertainty-only) sampling")
+
     # Initialize AL loop
     al_loop = ActiveLearningLoop(config, experiment_name)
-    
+
     # Run
     results_df = al_loop.run(
         metadata_path=METADATA_PATH,
