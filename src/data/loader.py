@@ -5,6 +5,7 @@ Convert box2d → YOLO format.
 """
 
 import json
+import os
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -112,3 +113,61 @@ def get_all_metadata(json_path: str) -> list[dict]:
     """Load BDD100K annotations và trích xuất metadata."""
     annotations = load_bdd100k_annotations(json_path)
     return [extract_metadata(annotation) for annotation in annotations]
+
+
+def build_image_path_map(base_dirs: List[str]) -> Dict[str, str]:
+    """
+    Xây map từ filename → full path của ảnh.
+    Tìm ảnh trong nhiều thư mục khác nhau.
+
+    Args:
+        base_dirs: Danh sách thư mục base để tìm ảnh
+
+    Returns:
+        Dict {filename: full_path}
+    """
+    path_map = {}
+
+    for base_dir in base_dirs:
+        if not os.path.exists(base_dir):
+            continue
+
+        for root, dirs, files in os.walk(base_dir):
+            for f in files:
+                if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    path_map[f] = os.path.join(root, f)
+
+    return path_map
+
+
+def filter_images_with_labels(metadata_list: List[dict], image_path_map: Dict[str, str]) -> List[dict]:
+    """
+    Filter metadata: chỉ giữ lại samples có ảnh tồn tại VÀ có detection labels.
+
+    Args:
+        metadata_list: Danh sách metadata
+        image_path_map: Map filename → path
+
+    Returns:
+        Danh sách metadata đã filter
+    """
+    filtered = []
+
+    for meta in metadata_list:
+        filename = meta.get("filename", "")
+        labels = meta.get("labels", [])
+
+        # Kiểm tra ảnh tồn tại
+        if filename not in image_path_map:
+            continue
+
+        # Kiểm tra có detection labels (box2d)
+        has_detection = any("box2d" in label for label in labels)
+        if not has_detection:
+            continue
+
+        # Thêm full_path vào metadata
+        meta["image_path"] = image_path_map[filename]
+        filtered.append(meta)
+
+    return filtered

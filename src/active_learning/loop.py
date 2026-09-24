@@ -15,7 +15,11 @@ import math
 from sampling.uncertainty import calc_image_uncertainty
 from sampling.stratified import stratified_sampling, calculate_batch_diversity
 from training.trainer import YOLOTrainer
-from data.loader import get_all_metadata, labels_to_yolo_lines
+from data.loader import (
+    get_all_metadata,
+    build_image_path_map,
+    filter_images_with_labels
+)
 from metrics.entropy import calc_batch_entropy
 
 class ActiveLearningLoop:
@@ -61,13 +65,13 @@ class ActiveLearningLoop:
         self.history = []
         self.metadata_path = None
 
-    def initialize(self, metadata_path: str, image_dir: str):
+    def initialize(self, metadata_path: str, image_dirs: List[str]):
         """
-        Khởi tạo: Load metadata và chọn initial batch.
+        Khởi tạo: Load metadata, tìm image paths, và chọn initial batch.
 
         Args:
             metadata_path: Đường dẫn đến annotations JSON
-            image_dir: Thư mục chứa ảnh
+            image_dirs: Danh sách thư mục base chứa ảnh
         """
 
         random.seed(self.seed)
@@ -75,8 +79,17 @@ class ActiveLearningLoop:
 
         print(f"[INIT] Loading metadata from {metadata_path}...")
 
-        self.all_metadata = get_all_metadata(metadata_path)
-        self.image_dir = Path(image_dir)
+        # Load metadata
+        raw_metadata = get_all_metadata(metadata_path)
+
+        print(f"[INIT] Building image path index...")
+        # Build image path map (tìm ảnh trong nhiều thư mục)
+        image_path_map = build_image_path_map(image_dirs)
+        print(f"[INIT] Found {len(image_path_map)} images")
+
+        # Filter: chỉ giữ samples có ảnh + detection labels
+        self.all_metadata = filter_images_with_labels(raw_metadata, image_path_map)
+        print(f"[INIT] Valid samples: {len(self.all_metadata)}/{len(raw_metadata)}")
 
         # tất cả các indicies ban đầu đều chưa có label
         self.unlabeled_indices = set(range(len(self.all_metadata)))
@@ -120,15 +133,16 @@ class ActiveLearningLoop:
         print(f"\n[ROUND {round_num}] Training model...")
         print(f"[ROUND {round_num}] Labeled samples: {len(self.labeled_indices)}")
 
-        # lấy danh sách đã label
+        # lấy danh sách đã label (sử dụng image_path đã được resolve)
         labeled_images = []
         labeled_metadata = []
 
         for i in self.labeled_indices:
-            image_path = self.image_dir / self.all_metadata[i]["filename"]
-            if image_path.exists():
-                labeled_images.append(str(image_path))
-                labeled_metadata.append(self.all_metadata[i])
+            meta = self.all_metadata[i]
+            image_path = meta.get("image_path")
+            if image_path and Path(image_path).exists():
+                labeled_images.append(image_path)
+                labeled_metadata.append(meta)
 
         if len(labeled_images) == 0:
             raise ValueError("Không có ảnh nào để train!")
@@ -178,9 +192,10 @@ class ActiveLearningLoop:
         uncertainty_scores = {}
 
         for idx in unlabeled_list:
-            image_path = self.image_dir / self.all_metadata[idx]["filename"]
+            meta = self.all_metadata[idx]
+            image_path = meta.get("image_path")
 
-            if not image_path.exists():
+            if not image_path or not Path(image_path).exists():
                uncertainty_scores[idx] = 0.0
                continue
 
