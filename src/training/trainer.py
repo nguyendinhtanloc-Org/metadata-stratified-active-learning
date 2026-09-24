@@ -4,8 +4,9 @@ Quản lý việc train/re-train model với labeled data.
 """
 
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 from ultralytics import YOLO
+from sklearn.model_selection import train_test_split
 import shutil
 import yaml
 import torch
@@ -59,20 +60,20 @@ class YOLOTrainer:
         except ImportError:
             return False
 
-    def prepare_dataset(
+    def prepare_dataset_with_metadata(
         self,
         image_paths: List[str],
-        labels_dir: str,
-        output_dir: str = "data/processed/yolo_dataset" 
+        metadata_list: List[Dict],
+        output_dir: str = "data/processed/yolo_dataset"
     ) -> str:
         """
-        Chuẩn bị dataset theo format YOLO.
-        
+        Chuẩn bị dataset từ metadata (labels nằm trong metadata, không phải file riêng).
+
         Args:
-            image_paths: Danh sách đường dẫn ảnh đã label
-            labels_dir: Thư mục chứa labels (YOLO format)
+            image_paths: Danh sách đường dẫn ảnh
+            metadata_list: Danh sách metadata tương ứng
             output_dir: Thư mục output
-        
+
         Returns:
             Đường dẫn đến dataset.yaml
         """
@@ -88,27 +89,44 @@ class YOLOTrainer:
             d.mkdir(parents=True, exist_ok=True)
 
         # split train/test (80/20)
-        n_train = int(len(image_paths) * 0.8)
-        train_paths = image_paths[:n_train]
-        val_paths= image_paths[n_train:]
+        train_indices, val_indices = train_test_split(
+            range(len(image_paths)),
+            test_size=0.2,
+            random_state=42
+        )
 
-        # Link/copy ảnh và labels cho train
-        for image_path in train_paths:
+        # Import hàm convert labels
+        from data.loader import labels_to_yolo_lines
+
+        # Copy ảnh và tạo labels cho train
+        for idx in train_indices:
+            image_path = image_paths[idx]
+            metadata = metadata_list[idx]
             image_name = Path(image_path).name
+
             # copy ảnh
             shutil.copy(image_path, images_train / image_name)
-            # copy label (nếu có)
-            label_path = Path(labels_dir) / f"{Path(image_path).stem}.txt"
 
-            if label_path.exists():
-                shutil.copy(label_path, labels_train / f"{Path(image_path).stem}.txt")
+            # tạo label file từ metadata
+            yolo_lines = labels_to_yolo_lines(metadata.get("labels", []))
+            if yolo_lines:
+                label_file = labels_train / f"{Path(image_path).stem}.txt"
+                with open(label_file, "w") as f:
+                    f.write("\n".join(yolo_lines))
 
-        for image_path in val_paths:
+        # Copy ảnh và tạo labels cho val
+        for idx in val_indices:
+            image_path = image_paths[idx]
+            metadata = metadata_list[idx]
             image_name = Path(image_path).name
+
             shutil.copy(image_path, images_val / image_name)
-            label_path = Path(labels_dir) / f"{Path(image_path).stem}.txt"
-            if label_path.exists():
-                shutil.copy(label_path, labels_val / f"{Path(image_path).stem}.txt")
+
+            yolo_lines = labels_to_yolo_lines(metadata.get("labels", []))
+            if yolo_lines:
+                label_file = labels_val / f"{Path(image_path).stem}.txt"
+                with open(label_file, "w") as f:
+                    f.write("\n".join(yolo_lines))
 
         # tạo dataset.yaml
         dataset_config = {
@@ -134,7 +152,7 @@ class YOLOTrainer:
         with open(yaml_path, "w") as f:
             yaml.dump(dataset_config, f)
 
-        return str(yaml_path)    
+        return str(yaml_path)
     
     def train(
         self,
