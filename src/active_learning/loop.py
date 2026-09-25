@@ -3,11 +3,10 @@ Active Learning Loop.
 Kết hợp tất cả modules để chạy AL experiment.
 """
 
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 from pathlib import Path
 import pandas as pd 
 from datetime import datetime
-from random import sample
 import random
 import pickle
 import math
@@ -47,6 +46,7 @@ class ActiveLearningLoop:
         # các tham số từ config
         self.initial_budget = config.get("initial_budget", 1000)
         self.batch_size = config.get("batch_size", 500)
+        self.train_batch_size = config.get("train_batch_size", 16)
         self.num_rounds = config.get("num_rounds", 10)
         self.num_classes = config.get("num_classes", 10)
         self.stratify_fields = config.get("stratify_fields", ["weather", "scene", "timeofday"])
@@ -64,6 +64,7 @@ class ActiveLearningLoop:
         self.all_metadata = []
         self.history = []
         self.metadata_path = None
+        self.valid_labeled_indices = set()
 
     def initialize(self, metadata_path: str, image_dirs: List[str]):
         """
@@ -99,7 +100,7 @@ class ActiveLearningLoop:
         print(f"[INIT] Initial budget: {self.initial_budget}")
 
         # chọn initial batch ngẫu nhiên (random sampling)
-        initial_indices = sample(
+        initial_indices = random.sample(
             list(self.unlabeled_indices),
             min(self.initial_budget, len(self.unlabeled_indices))
         )
@@ -107,6 +108,13 @@ class ActiveLearningLoop:
         # chuyển sang labeled
         self.labeled_indices.update(initial_indices)
         self.unlabeled_indices -= set(initial_indices)
+
+        # Validate initial batch
+        for idx in initial_indices:
+            meta = self.all_metadata[idx]
+            image_path = meta.get("image_path")
+            if image_path and Path(image_path).exists():
+                self.valid_labeled_indices.add(idx)
 
         print(f"[INIT] Selected {len(initial_indices)} initial samples")
 
@@ -131,18 +139,19 @@ class ActiveLearningLoop:
         """
 
         print(f"\n[ROUND {round_num}] Training model...")
-        print(f"[ROUND {round_num}] Labeled samples: {len(self.labeled_indices)}")
 
         # lấy danh sách đã label (sử dụng image_path đã được resolve)
         labeled_images = []
         labeled_metadata = []
 
-        for i in self.labeled_indices:
+        for i in self.valid_labeled_indices:
             meta = self.all_metadata[i]
             image_path = meta.get("image_path")
             if image_path and Path(image_path).exists():
                 labeled_images.append(image_path)
                 labeled_metadata.append(meta)
+
+        print(f"[ROUND {round_num}] Labeled samples: {len(self.valid_labeled_indices)}")
 
         if len(labeled_images) == 0:
             raise ValueError("Không có ảnh nào để train!")
@@ -151,7 +160,8 @@ class ActiveLearningLoop:
         dataset_yaml = self.trainer.prepare_dataset_with_metadata(
             image_paths = labeled_images,
             metadata_list = labeled_metadata,
-            output_dir = f"data/processed/{self.experiment_name}/round_{round_num}"
+            output_dir = f"data/processed/{self.experiment_name}/round_{round_num}",
+            split_seed=self.seed
         )
 
         # train
@@ -159,7 +169,7 @@ class ActiveLearningLoop:
         train_results = self.trainer.train(
             dataset_yaml = dataset_yaml,
             epochs = self.config.get("epochs", 10),
-            batch_size = self.config.get("batch_size", 16),
+            batch_size = self.train_batch_size,
             imgsz = self.config.get("imgsz", 640),
             save_name = save_name
         )
@@ -256,23 +266,32 @@ class ActiveLearningLoop:
         self.labeled_indices.update(new_indices)
         self.unlabeled_indices -= set(new_indices)
 
+        # Validate và update valid_labeled_indices
+        for idx in new_indices:
+            meta = self.all_metadata[idx]
+            image_path = meta.get("image_path")
+
+            if image_path and Path(image_path).exists():
+                self.valid_labeled_indices.add(idx)
+
         print(f"[UPDATE] Total labeled: {len(self.labeled_indices)}")
         print(f"[UPDATE] Remaining unlabeled: {len(self.unlabeled_indices)}")
 
-    def run(self, metadata_path: str, image_dir: str) -> pd.DataFrame:
+    def run(self, metadata_path: str, image_dirs: List[str]) -> pd.DataFrame:
         """
         Chạy toàn bộ Active Learning loop.
         
         Args:
             metadata_path: Đường dẫn đến annotations JSON
-            image_dir: Thư mục chứa ảnh
+            image_dirs: Thư mục chứa ảnh
         
         Returns:
             DataFrame chứa lịch sử kết quả các rounds
         """
 
-        # Kiểm tra checkpoint có tồn tại không
-        checkpoint_path = f"checkpoints/{self.experiment_name}.pkl"
+        # Dùng cùng path format cho cả load và save
+        checkpoint_path = f"checkpoints/{self.experiment_name}_checkpoint.pkl"
+
         start_round = 0
 
         if Path(checkpoint_path).exists():
@@ -285,7 +304,7 @@ class ActiveLearningLoop:
                 start_round = self.history[-1]["round"] + 1
                 print(f"[INFO] Resuming from round {start_round}")
         else:
-            self.initialize(metadata_path, image_dir)
+            self.initialize(metadata_path, image_dirs)
 
         print(f"\n{'='*50}")
         print(f"Starting Active Learning Loop")
@@ -353,15 +372,19 @@ class ActiveLearningLoop:
         print(f"Results saved to: {output_path}")
         print(f"{'='*50}")
 
-        self.save_checkpoint(f"checkpoints/{self.experiment_name}_round_{round_num}.pkl")
+        self.save_checkpoint(checkpoint_path)
         
         return df
 
     def save_checkpoint(self, path: str):
         """Lưu checkpoint để có thể resume."""
         
+        # Create directory if it doesn't exist
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
         checkpoint = {
             "labeled_indices": list(self.labeled_indices),
+            "valid_labeled_indices": list(self.valid_labeled_indices),
             "unlabeled_indices": list(self.unlabeled_indices),
             "history": self.history,
             "seed": self.seed,
@@ -375,6 +398,7 @@ class ActiveLearningLoop:
         with open(path, "rb") as f:
             checkpoint = pickle.load(f)
         self.labeled_indices = set(checkpoint["labeled_indices"])
+        self.valid_labeled_indices = set(checkpoint.get("valid_labeled_indices", []))
         self.unlabeled_indices = set(checkpoint["unlabeled_indices"])
         self.history = checkpoint["history"]
         self.seed = checkpoint.get("seed", 42)
