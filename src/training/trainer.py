@@ -11,6 +11,9 @@ import shutil
 import yaml
 import torch
 
+from data.loader import YOLO_CLASS_NAMES, labels_to_yolo_lines
+
+
 class YOLOTrainer:
     """
     Trainer class cho YOLO model trong Active Learning loop.
@@ -36,6 +39,14 @@ class YOLOTrainer:
         self.project_dir = Path(project_dir)
         self.model = None
         self.best_model_path = None
+        self.pretrained_path = f"{self.model_name}.pt"
+
+        # Verify GPU availability
+        if device != "cpu" and not self._check_cuda():
+            raise RuntimeError(
+                f"CUDA device requested but not available. "
+                f"Either install CUDA drivers or set device='cpu' in config."
+            )
 
     def load_model(self, model_path: Optional[str] = None):
         """
@@ -46,11 +57,13 @@ class YOLOTrainer:
         """
 
         if model_path and Path(model_path).exists():
-            # load từ checkpoint
             self.model = YOLO(model_path) 
         else:
-            # Load pretrained model
-            self.model = YOLO(f"{self.model_name}.pt")
+            # Load pretrained nhưng KHÔNG download lại nếu đã có
+            if Path(self.pretrained_path).exists():
+                self.model = YOLO(self.pretrained_path)
+            else:
+                self.model = YOLO(f"{self.model_name}.pt")
 
     def _check_cuda(self) -> bool:
         """Kiểm tra CUDA có khả dụng không."""
@@ -64,7 +77,8 @@ class YOLOTrainer:
         self,
         image_paths: List[str],
         metadata_list: List[Dict],
-        output_dir: str = "data/processed/yolo_dataset"
+        output_dir: str = "data/processed/yolo_dataset",
+        split_seed: int = 42
     ) -> str:
         """
         Chuẩn bị dataset từ metadata (labels nằm trong metadata, không phải file riêng).
@@ -92,11 +106,8 @@ class YOLOTrainer:
         train_indices, val_indices = train_test_split(
             range(len(image_paths)),
             test_size=0.2,
-            random_state=42
+            random_state=split_seed
         )
-
-        # Import hàm convert labels
-        from data.loader import labels_to_yolo_lines
 
         # Copy ảnh và tạo labels cho train
         for idx in train_indices:
@@ -133,18 +144,7 @@ class YOLOTrainer:
             "path": str(output_path.absolute()),
             "train": "images/train",
             "val": "images/val",
-            "names": {
-                0: "pedestrian",
-                1: "rider",
-                2: "other person",
-                3: "bicycle",
-                4: "car",
-                5: "bus",
-                6: "truck",
-                7: "motorcycle",
-                8: "traffic light",
-                9: "traffic sign"
-            }
+            "names": YOLO_CLASS_NAMES
         }
 
         yaml_path = output_path / "dataset.yaml"
@@ -176,8 +176,14 @@ class YOLOTrainer:
             Dict chứa metrics kết quả
         """
 
+        # Load pretrained model CHỈ MỘT LẦN
         if self.model is None:
-            self.load_model()
+            # Round 0: dùng pretrained
+            # Round N (N>0): dùng best model từ round trước
+            if self.best_model_path and Path(self.best_model_path).exists():
+                self.load_model(self.best_model_path)
+            else:
+                self.load_model()
 
         # run training
         results = self.model.train(
