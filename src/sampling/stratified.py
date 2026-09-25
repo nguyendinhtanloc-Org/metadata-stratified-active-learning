@@ -39,16 +39,15 @@ def sample_proportional_to_stratum_size(
 ) -> Dict[Tuple, int]:
     """
     Phân bổ số lượng sample cho mỗi stratum theo tỷ lệ kích thước.
-    
+        
     Args:
         strata: Dict từ stratify_by_metadata
         total_samples: Tổng số samples cần chọn
-    
+        
     Returns:
         Dict với key = stratum, value = số samples cho stratum đó
     """
-
-    # tổng số ảnh trong tất cả strata
+    
     total_size = sum(len(indices) for indices in strata.values())
 
     if total_size == 0:
@@ -58,33 +57,46 @@ def sample_proportional_to_stratum_size(
     remaining = total_samples
 
     for key, indices in strata.items():
-        # tính tỉ lệ
         proportion = len(indices) / total_size
-        # round xuống để đảm bảo rằng không vượt quá total
-        n_samples = int(proportion * total_samples)
-
-        # Đảm bảo không lấy nhiều hơn số ảnh trong stratum
+        # Dùng round() thay vì int()
+        n_samples = round(proportion * total_samples)
+        # Đảm bảo không vượt quá
         n_samples = min(n_samples, len(indices))
-
         allocation[key] = n_samples
         remaining -= n_samples
 
-    # Phân bổ remaining samples cho các stratum lớn nhất
+    # Phân bổ remaining một cách fair
     if remaining > 0:
+        # Sort theo tỷ lệ để ưu tiên strata lớn
         sorted_strata = sorted(
             strata.items(),
-            key = lambda x: len(x[1]), # Sort theo số lượng ảnh giảm dần
+            key=lambda x: len(x[1]) / total_size,
             reverse=True
         )
         
         for key, _ in sorted_strata:
             if remaining <= 0:
                 break
-
-            # thêm 1 sample nếu stratum còn capacity
             if allocation[key] < len(strata[key]):
                 allocation[key] += 1
                 remaining -= 1
+    elif remaining < 0:
+        # Over-allocation: Giảm từ strata nhỏ nhất
+        sorted_strata = sorted(
+            strata.items(),
+            key=lambda x: len(x[1]) / total_size
+        )
+        
+        for key, _ in sorted_strata:
+            if remaining >= 0:
+                break
+            if allocation[key] > 0:
+                allocation[key] -= 1
+                remaining += 1
+
+    # Verify tổng = total_samples
+    assert sum(allocation.values()) == total_samples, \
+        f"Allocation {sum(allocation.values())} != {total_samples}"
 
     return allocation
 
