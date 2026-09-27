@@ -83,16 +83,13 @@ class TestCalcBatchEntropy:
 
         assert entropy == 0.0
 
-    def test_missing_filed(self):
+    def test_missing_field(self):
         """Test với field không tồn tại."""
 
         metadata = [{"filename": "a.jpg"}]
-        # sẽ raise KeyError hoặc dùng default "unknown"
-        entropy = calc_batch_entropy(metadata, "nonexistent")
-
-        # nếu có default "unknown", entropy = 0
-        assert entropy == 0.0
-
+        
+        with pytest.raises(KeyError):
+            calc_batch_entropy(metadata, "nonexistent")
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
