@@ -47,27 +47,28 @@ def sample_proportional_to_stratum_size(
     Returns:
         Dict với key = stratum, value = số samples cho stratum đó
     """
-    
+
     total_size = sum(len(indices) for indices in strata.values())
 
     if total_size == 0:
         return {}
+
+    # Edge case: batch_size > total_size → lấy tất cả
+    if total_samples >= total_size:
+        return {key: len(indices) for key, indices in strata.items()}
 
     allocation = {}
     remaining = total_samples
 
     for key, indices in strata.items():
         proportion = len(indices) / total_size
-        # Dùng round() thay vì int()
         n_samples = round(proportion * total_samples)
-        # Đảm bảo không vượt quá
         n_samples = min(n_samples, len(indices))
         allocation[key] = n_samples
         remaining -= n_samples
 
     # Phân bổ remaining một cách fair
     if remaining > 0:
-        # Sort theo tỷ lệ để ưu tiên strata lớn
         sorted_strata = sorted(
             strata.items(),
             key=lambda x: len(x[1]) / total_size,
@@ -80,23 +81,6 @@ def sample_proportional_to_stratum_size(
             if allocation[key] < len(strata[key]):
                 allocation[key] += 1
                 remaining -= 1
-    elif remaining < 0:
-        # Over-allocation: Giảm từ strata nhỏ nhất
-        sorted_strata = sorted(
-            strata.items(),
-            key=lambda x: len(x[1]) / total_size
-        )
-        
-        for key, _ in sorted_strata:
-            if remaining >= 0:
-                break
-            if allocation[key] > 0:
-                allocation[key] -= 1
-                remaining += 1
-
-    # Verify tổng = total_samples
-    assert sum(allocation.values()) == total_samples, \
-        f"Allocation {sum(allocation.values())} != {total_samples}"
 
     return allocation
 

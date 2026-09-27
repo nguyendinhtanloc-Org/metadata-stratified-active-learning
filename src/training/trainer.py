@@ -67,9 +67,8 @@ class YOLOTrainer:
 
     def _check_cuda(self) -> bool:
         """Kiểm tra CUDA có khả dụng không."""
-
         try:
-            return torch.cuda.is_available()
+            return torch.cuda.is_available() and torch.cuda.device_count() > 0
         except ImportError:
             return False
 
