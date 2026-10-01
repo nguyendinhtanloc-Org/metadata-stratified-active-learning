@@ -4,7 +4,7 @@ Quản lý việc train/re-train model với labeled data.
 """
 
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 from ultralytics import YOLO
 from sklearn.model_selection import train_test_split
 import shutil
@@ -175,7 +175,7 @@ class YOLOTrainer:
             Dict chứa metrics kết quả
         """
 
-        # Load pretrained model CHỈ MỘT LẦN
+        # Load pretrained model CHỉ MỘT LẦN
         if self.model is None:
             # Round 0: dùng pretrained
             # Round N (N>0): dùng best model từ round trước
@@ -251,4 +251,42 @@ class YOLOTrainer:
         
         return self.model.predict(source=image_path, **kwargs)
 
+    def predict_batch(self, image_paths: List[str], batch_size: int = 32, show_progress: bool = True) -> List:
+        """
+        Predict trên nhiều ảnh cùng lúc (batch prediction).
         
+        Args:
+            image_paths: Danh sách đường dẫn ảnh
+            batch_size: Số ảnh xử lý mỗi batch
+            show_progress: Hiển thị progress bar
+        
+        Returns:
+            List các YOLO Results objects
+        """
+        if self.model is None:
+            raise ValueError("Model chưa được load. Gọi load_model() trước.")
+        
+        results = []
+        total = len(image_paths)
+        
+        # Xử lý từng batch
+        for i in range(0, total, batch_size):
+            batch = image_paths[i:i + batch_size]
+            
+            # Batch predict - nhanh hơn nhiều so với từng ảnh
+            batch_results = self.model.predict(
+                source=batch,
+                batch=batch_size,
+                verbose=False
+            )
+            
+            # Nếu batch chỉ có 1 ảnh, ultralytics trả về 1 object thay vì list
+            if isinstance(batch_results, list):
+                results.extend(batch_results)
+            else:
+                results.append(batch_results)
+            
+            if show_progress and (i + batch_size) % 1000 == 0:
+                print(f"      Predicted {min(i + batch_size, total)}/{total} images")
+        
+        return results

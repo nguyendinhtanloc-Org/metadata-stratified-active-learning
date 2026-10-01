@@ -196,38 +196,55 @@ class ActiveLearningLoop:
         # chuyển sang list để index
         unlabeled_list = list(self.unlabeled_indices)
 
-        # tính uncertainty cho tất cả các unlabeled images
+        # tính uncertainty cho tất cả các unlabeled images (batch prediction)
         print(f"[ROUND {round_num}] Computing uncertainty scores...")
 
         uncertainty_scores = {}
 
+        # Lấy danh sách đường dẫn ảnh hợp lệ
+        valid_image_paths = []
+        valid_indices = []
+        
         for idx in unlabeled_list:
             meta = self.all_metadata[idx]
             image_path = meta.get("image_path")
-
-            if not image_path or not Path(image_path).exists():
-               uncertainty_scores[idx] = 0.0
-               continue
-
-            try:
-                result = self.trainer.predict(str(image_path), verbose=False)
+            if image_path and Path(image_path).exists():
+                valid_image_paths.append(image_path)
+                valid_indices.append(idx)
+        
+        print(f"[ROUND {round_num}] Predicting {len(valid_image_paths)} images in batches...")
+        
+        # Batch prediction - NHANH HƠN NHIỀU
+        try:
+            batch_results = self.trainer.predict_batch(valid_image_paths, batch_size=32, show_progress=True)
+            
+            for idx, result in zip(valid_indices, batch_results):
                 if result is None:
-                    # Model không predict được → uncertainty cao nhất
                     uncertainty_scores[idx] = math.log2(self.num_classes)
                 else:
-                    # Lấy result đầu tiên (nếu là list)
                     if isinstance(result, list):
                         result = result[0]
                     uncertainty_scores[idx] = calc_image_uncertainty(result, self.num_classes)
-            except FileNotFoundError:
-                print(f"[WARNING] Image not found: {image_path}")
-                uncertainty_scores[idx] = 0.0
-            except RuntimeError as e:
-                # CUDA OOM hoặc lỗi nghiêm trọng
-                print(f"[ERROR] Runtime error predicting {image_path}: {e}")
-                raise  # Re-raise để không continue âm thầm
-            except Exception as e:
-                print(f"[WARNING] Failed to predict {image_path}: {e}")
+        except Exception as e:
+            print(f"[WARNING] Batch prediction failed: {e}, falling back to single prediction")
+            # Fallback: từng ảnh một
+            for idx in valid_indices:
+                meta = self.all_metadata[idx]
+                image_path = meta.get("image_path")
+                try:
+                    result = self.trainer.predict(str(image_path), verbose=False)
+                    if result is None:
+                        uncertainty_scores[idx] = math.log2(self.num_classes)
+                    else:
+                        if isinstance(result, list):
+                            result = result[0]
+                        uncertainty_scores[idx] = calc_image_uncertainty(result, self.num_classes)
+                except Exception:
+                    uncertainty_scores[idx] = 0.0
+
+        # Các ảnh không tồn tại có uncertainty = 0
+        for idx in unlabeled_list:
+            if idx not in uncertainty_scores:
                 uncertainty_scores[idx] = 0.0
 
         # startify sampling
