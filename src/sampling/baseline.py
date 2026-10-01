@@ -3,11 +3,14 @@ Baseline Sampling: Uncertainty-only (không có metadata stratification).
 Dùng để so sánh với stratified sampling.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Any
 
 def baseline_sampling(
     uncertainty_scores: Dict[int, float],
-    batch_size: int
+    batch_size: int,
+    metadata_list: Any = None,
+    stratify_fields: Any = None,
+    **kwargs
 ) -> List[int]:
     """
     Chọn batch chỉ dựa trên uncertainty cao nhất.
@@ -16,6 +19,9 @@ def baseline_sampling(
     Args:
         uncertainty_scores: Dict {image_index: uncertainty_score}
         batch_size: Số lượng ảnh cần chọn
+        metadata_list: Ignored (để compatibility với stratified_sampling API)
+        stratify_fields: Ignored (để compatibility với stratified_sampling API)
+        **kwargs: Ignored (để future-proof)
 
     Returns:
         List các indices được chọn (top-K theo uncertainty)
