@@ -13,6 +13,7 @@ import math
 
 from sampling.uncertainty import calc_image_uncertainty
 from sampling.stratified import stratified_sampling, calculate_batch_diversity
+from sampling.baseline import baseline_sampling
 from training.trainer import YOLOTrainer
 from data.loader import (
     get_all_metadata,
@@ -50,6 +51,7 @@ class ActiveLearningLoop:
         self.num_rounds = config.get("num_rounds", 10)
         self.num_classes = config.get("num_classes", 10)
         self.stratify_fields = config.get("stratify_fields", ["weather", "scene", "timeofday"])
+        self.use_baseline = config.get("use_baseline", False)  # True = baseline, False = stratified
 
         # components
         self.trainer = YOLOTrainer(
@@ -247,15 +249,23 @@ class ActiveLearningLoop:
             if idx not in uncertainty_scores:
                 uncertainty_scores[idx] = 0.0
 
-        # startify sampling
-        print(f"[ROUND {round_num}] Running stratified sampling...")
-
-        selected_indices = stratified_sampling(
-            metadata_list = self.all_metadata,
-            uncertainty_scores = uncertainty_scores,
-            batch_size = min(self.batch_size, len(unlabeled_list)),
-            stratify_fields= self.stratify_fields
-        )
+        # Chọn sampling method dựa trên config
+        if self.use_baseline:
+            print(f"[ROUND {round_num}] Running BASELINE sampling (uncertainty-only)...")
+            selected_indices = baseline_sampling(
+                uncertainty_scores = uncertainty_scores,
+                batch_size = min(self.batch_size, len(unlabeled_list)),
+                metadata_list = self.all_metadata,
+                stratify_fields = self.stratify_fields
+            )
+        else:
+            print(f"[ROUND {round_num}] Running STRATIFIED sampling (metadata + uncertainty)...")
+            selected_indices = stratified_sampling(
+                metadata_list = self.all_metadata,
+                uncertainty_scores = uncertainty_scores,
+                batch_size = min(self.batch_size, len(unlabeled_list)),
+                stratify_fields= self.stratify_fields
+            )
 
         # tính diversity của batch đã chọn
         diversity = calculate_batch_diversity(
