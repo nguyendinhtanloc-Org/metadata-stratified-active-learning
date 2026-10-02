@@ -10,6 +10,7 @@ from sklearn.model_selection import train_test_split
 import shutil
 import yaml
 import torch
+import gc
 
 from data.loader import YOLO_CLASS_NAMES, labels_to_yolo_lines
 
@@ -81,14 +82,6 @@ class YOLOTrainer:
     ) -> str:
         """
         Chuẩn bị dataset từ metadata (labels nằm trong metadata, không phải file riêng).
-
-        Args:
-            image_paths: Danh sách đường dẫn ảnh
-            metadata_list: Danh sách metadata tương ứng
-            output_dir: Thư mục output
-
-        Returns:
-            Đường dẫn đến dataset.yaml
         """
 
         output_path = Path(output_dir)
@@ -97,48 +90,37 @@ class YOLOTrainer:
         labels_train = output_path / "labels" / "train"
         labels_val = output_path / "labels" / "val"
 
-        # Tạo directories
         for d in [images_train, images_val, labels_train, labels_val]:
             d.mkdir(parents=True, exist_ok=True)
 
-        # split train/test (80/20)
         train_indices, val_indices = train_test_split(
             range(len(image_paths)),
             test_size=0.2,
             random_state=split_seed
         )
 
-        # Copy ảnh và tạo labels cho train
         for idx in train_indices:
             image_path = image_paths[idx]
             metadata = metadata_list[idx]
             image_name = Path(image_path).name
-
-            # copy ảnh
             shutil.copy(image_path, images_train / image_name)
-
-            # tạo label file từ metadata
             yolo_lines = labels_to_yolo_lines(metadata.get("labels", []))
             if yolo_lines:
                 label_file = labels_train / f"{Path(image_path).stem}.txt"
                 with open(label_file, "w") as f:
                     f.write("\n".join(yolo_lines))
 
-        # Copy ảnh và tạo labels cho val
         for idx in val_indices:
             image_path = image_paths[idx]
             metadata = metadata_list[idx]
             image_name = Path(image_path).name
-
             shutil.copy(image_path, images_val / image_name)
-
             yolo_lines = labels_to_yolo_lines(metadata.get("labels", []))
             if yolo_lines:
                 label_file = labels_val / f"{Path(image_path).stem}.txt"
                 with open(label_file, "w") as f:
                     f.write("\n".join(yolo_lines))
 
-        # tạo dataset.yaml
         dataset_config = {
             "path": str(output_path.absolute()),
             "train": "images/train",
@@ -147,7 +129,6 @@ class YOLOTrainer:
         }
 
         yaml_path = output_path / "dataset.yaml"
-
         with open(yaml_path, "w") as f:
             yaml.dump(dataset_config, f)
 
@@ -161,30 +142,14 @@ class YOLOTrainer:
         imgsz: int = 640,
         save_name: str = "train"
         ) -> dict:
-        """
-        Train YOLO model.
-        
-        Args:
-            dataset_yaml: Đường dẫn đến dataset.yaml
-            epochs: Số epochs
-            batch_size: Batch size
-            imgsz: Image size
-            save_name: Tên experiment
-        
-        Returns:
-            Dict chứa metrics kết quả
-        """
+        """Train YOLO model."""
 
-        # Load pretrained model CHỉ MỘT LẦN
         if self.model is None:
-            # Round 0: dùng pretrained
-            # Round N (N>0): dùng best model từ round trước
             if self.best_model_path and Path(self.best_model_path).exists():
                 self.load_model(self.best_model_path)
             else:
                 self.load_model()
 
-        # run training
         results = self.model.train(
             data = dataset_yaml,
             epochs = epochs,
@@ -197,7 +162,6 @@ class YOLOTrainer:
             verbose = False
         )
 
-        # lưu best model path
         self.best_model_path = str(Path(self.project_dir) / save_name / "weights" / "best.pt")
 
         return {
@@ -207,18 +171,9 @@ class YOLOTrainer:
         }
 
     def evaluate(self, dataset_yaml: str) -> dict:
-        """
-        Evaluate model trên validation set.
-        
-        Args:
-            dataset_yaml: Đường dẫn đến dataset.yaml
-        
-        Returns:
-            Dict chứa evaluation metrics
-        """
-
+        """Evaluate model."""
         if self.model is None:
-            raise ValueError("Model chưa được load. Gọi load_model() trước.")
+            raise ValueError("Model chưa được load.")
 
         metrics = self.model.val(
             data = dataset_yaml,
@@ -235,45 +190,33 @@ class YOLOTrainer:
         }
 
     def predict(self, image_path: str, **kwargs):
-        """
-        Predict trên một ảnh.
-        
-        Args:
-            image_path: Đường dẫn ảnh
-            **kwargs: Các tham số khác cho predict
-        
-        Returns:
-            YOLO Results object
-        """
-
+        """Predict trên một ảnh."""
         if self.model is None:
-            raise ValueError("Model chưa được load. Gọi load_model() trước.")
-        
+            raise ValueError("Model chưa được load.")
         return self.model.predict(source=image_path, **kwargs)
 
-    def predict_batch(self, image_paths: List[str], batch_size: int = 32, show_progress: bool = True) -> List:
+    def predict_batch(self, image_paths: List[str], batch_size: int = 8, show_progress: bool = True) -> List:
         """
-        Predict trên nhiều ảnh cùng lúc (batch prediction).
+        Predict trên nhiều ảnh cùng lúc với batch size nhỏ.
         
         Args:
             image_paths: Danh sách đường dẫn ảnh
-            batch_size: Số ảnh xử lý mỗi batch
+            batch_size: Số ảnh xử lý mỗi batch (NHỎ để tránh OOM)
             show_progress: Hiển thị progress bar
         
         Returns:
             List các YOLO Results objects
         """
         if self.model is None:
-            raise ValueError("Model chưa được load. Gọi load_model() trước.")
+            raise ValueError("Model chưa được load.")
         
         results = []
         total = len(image_paths)
         
-        # Xử lý từng batch
         for i in range(0, total, batch_size):
             batch = image_paths[i:i + batch_size]
             
-            # Batch predict - nhanh hơn nhiều so với từng ảnh
+            # Batch predict với batch_size NHỎ
             batch_results = self.model.predict(
                 source=batch,
                 batch=batch_size,
@@ -286,7 +229,13 @@ class YOLOTrainer:
             else:
                 results.append(batch_results)
             
-            if show_progress and (i + batch_size) % 1000 == 0:
+            # Dọn memory SAU MỖI BATCH
+            if i % 500 == 0 and i > 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            if show_progress and (i + batch_size) % 2000 == 0:
                 print(f"      Predicted {min(i + batch_size, total)}/{total} images")
         
         return results
