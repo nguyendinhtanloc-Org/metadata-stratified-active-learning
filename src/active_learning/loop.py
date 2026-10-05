@@ -110,7 +110,7 @@ class ActiveLearningLoop:
                 meta["image_path"] = None
         
         # Filter images with labels
-        valid_metadata = filter_images_with_labels(self.all_metadata)
+        valid_metadata = filter_images_with_labels(self.all_metadata, self.image_path_map)
         
         print(f"[INIT] Found {len(self.all_metadata)} images")
         print(f"[INIT] Valid samples: {len(valid_metadata)}/{len(self.all_metadata)}")
