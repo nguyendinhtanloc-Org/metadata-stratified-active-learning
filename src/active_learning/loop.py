@@ -73,6 +73,7 @@ class ActiveLearningLoop:
         )
         
         self.all_metadata = []
+        self.filtered_metadata = []
         self.image_path_map = {}
         
         # Labeled/Unlabeled tracking
@@ -110,11 +111,12 @@ class ActiveLearningLoop:
                 meta["image_path"] = None
         
         # Filter images with labels
-        valid_metadata = filter_images_with_labels(self.all_metadata, self.image_path_map)
-        
+        self.filtered_metadata = filter_images_with_labels(self.all_metadata, self.image_path_map)
+        valid_metadata = self.filtered_metadata
+
         print(f"[INIT] Found {len(self.all_metadata)} images")
         print(f"[INIT] Valid samples: {len(valid_metadata)}/{len(self.all_metadata)}")
-        
+
         # Initialize all as unlabeled
         self.unlabeled_indices = set(range(len(valid_metadata)))
         
@@ -123,7 +125,7 @@ class ActiveLearningLoop:
         print(f"[INIT] Initial budget: {self.initial_budget}")
         
         initial_indices = stratified_sampling(
-            metadata_list=valid_metadata,
+            metadata_list=self.filtered_metadata,
             uncertainty_scores={i: random.random() for i in range(len(valid_metadata))},
             batch_size=self.initial_budget,
             stratify_fields=self.stratify_fields
@@ -144,7 +146,7 @@ class ActiveLearningLoop:
         # Calculate initial diversity
         initial_metadata = [valid_metadata[i] for i in initial_indices]
         diversity = calculate_batch_diversity(
-            valid_metadata,
+            self.filtered_metadata,
             initial_indices,
             self.stratify_fields
         )
@@ -172,8 +174,18 @@ class ActiveLearningLoop:
         
         # Prepare training data
         labeled_list = list(self.valid_labeled_indices)
-        labeled_metadata = [self.all_metadata[i] for i in labeled_list]
-        image_paths = [self.all_metadata[i].get("image_path") for i in labeled_list]
+        labeled_metadata = [self.filtered_metadata[i] for i in labeled_list]
+        image_paths = [self.filtered_metadata[i].get("image_path") for i in labeled_list]
+
+        # Filter out any images with None paths
+        valid_pairs = [(meta, path) for meta, path in zip(labeled_metadata, image_paths) if path is not None]
+
+        if len(valid_pairs) == 0:
+            raise ValueError("Không có ảnh hợp lệ để train!")
+
+        labeled_metadata, image_paths = zip(*valid_pairs)
+        labeled_metadata = list(labeled_metadata)
+        image_paths = list(image_paths)
         
         dataset_yaml = self.trainer.prepare_dataset_with_metadata(
             image_paths=image_paths,
@@ -226,7 +238,7 @@ class ActiveLearningLoop:
         valid_indices = []
         
         for idx in unlabeled_list:
-            meta = self.all_metadata[idx]
+            meta = self.filtered_metadata[idx]
             image_path = meta.get("image_path")
             if image_path and Path(image_path).exists():
                 valid_image_paths.append(image_path)
@@ -284,13 +296,13 @@ class ActiveLearningLoop:
             selected_indices = baseline_sampling(
                 uncertainty_scores = uncertainty_scores,
                 batch_size = min(self.batch_size, len(unlabeled_list)),
-                metadata_list = self.all_metadata,
+                metadata_list = self.filtered_metadata,
                 stratify_fields = self.stratify_fields
             )
         else:
             print(f"[ROUND {round_num}] Running STRATIFIED sampling (metadata + uncertainty)...")
             selected_indices = stratified_sampling(
-                metadata_list = self.all_metadata,
+                metadata_list = self.filtered_metadata,
                 uncertainty_scores = uncertainty_scores,
                 batch_size = min(self.batch_size, len(unlabeled_list)),
                 stratify_fields= self.stratify_fields
@@ -298,7 +310,7 @@ class ActiveLearningLoop:
 
         # tính diversity của batch đã chọn
         diversity = calculate_batch_diversity(
-            self.all_metadata,
+            self.filtered_metadata,
             selected_indices,
             self.stratify_fields
         )
@@ -324,7 +336,7 @@ class ActiveLearningLoop:
 
         # Validate và update valid_labeled_indices
         for idx in new_indices:
-            meta = self.all_metadata[idx]
+            meta = self.filtered_metadata[idx]
             image_path = meta.get("image_path")
 
             if image_path and Path(image_path).exists():
@@ -340,6 +352,7 @@ class ActiveLearningLoop:
             "unlabeled_indices": list(self.unlabeled_indices),
             "valid_labeled_indices": list(self.valid_labeled_indices),
             "results_history": self.results_history,
+            "filtered_metadata": self.filtered_metadata,
             "all_metadata": self.all_metadata
         }
         
@@ -352,11 +365,12 @@ class ActiveLearningLoop:
         """Load checkpoint."""
         with open(path, "rb") as f:
             checkpoint = pickle.load(f)
-        
+
         self.labeled_indices = set(checkpoint["labeled_indices"])
         self.unlabeled_indices = set(checkpoint["unlabeled_indices"])
         self.valid_labeled_indices = set(checkpoint["valid_labeled_indices"])
         self.results_history = checkpoint["results_history"]
+        self.filtered_metadata = checkpoint.get("filtered_metadata", [])
         self.all_metadata = checkpoint["all_metadata"]
 
     def run(self, metadata_path: str, image_dirs: List[str], output_dir: str = "results") -> pd.DataFrame:
@@ -430,7 +444,7 @@ class ActiveLearningLoop:
             
             # Calculate diversity
             diversity = calculate_batch_diversity(
-                self.all_metadata,
+                self.filtered_metadata,
                 new_indices,
                 self.stratify_fields
             )
