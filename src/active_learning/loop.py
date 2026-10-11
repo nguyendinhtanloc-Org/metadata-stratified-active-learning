@@ -5,12 +5,13 @@ Kết hợp tất cả modules để chạy AL experiment.
 
 from typing import List, Dict
 from pathlib import Path
-import pandas as pd 
+import pandas as pd
 from datetime import datetime
 import random
 import pickle
 import math
 import gc
+import torch  # Thêm cho memory management
 
 from sampling.uncertainty import calc_image_uncertainty
 from sampling.stratified import stratified_sampling, calculate_batch_diversity
@@ -208,7 +209,13 @@ class ActiveLearningLoop:
         
         print(f"[ROUND {round_num}] Training complete!")
         print(f"[ROUND {round_num}] mAP50: {train_results['map50']:.4f}")
-        
+
+        # Clear CUDA cache sau khi train để tránh memory leak
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            print(f"[MEMORY] GPU cache cleared")
+
         return train_results
     
     def select_batch(self, round_num: int) -> List[int]:
@@ -246,8 +253,8 @@ class ActiveLearningLoop:
         
         print(f"[ROUND {round_num}] Predicting {len(valid_image_paths)} images...")
         
-        # Compute uncertainty in small batches - XỬ LÝ NGAY, KHÔNG LƯU
-        batch_size = 4  # Nhỏ hơn để tránh OOM
+        # Compute uncertainty in batches - TĂNG BATCH SIZE ĐỂ NHANH HƠN
+        batch_size = 32  # 32 thay vì 4 - KHÔNG ảnh hưởng chất lượng, chỉ nhanh hơn
         
         try:
             for batch_start in range(0, len(valid_image_paths), batch_size):
@@ -373,6 +380,27 @@ class ActiveLearningLoop:
         self.filtered_metadata = checkpoint.get("filtered_metadata", [])
         self.all_metadata = checkpoint["all_metadata"]
 
+        # Re-validate paths sau khi load checkpoint
+        self._validate_labeled_indices()
+
+    def _validate_labeled_indices(self):
+        """Re-validate labeled indices để đảm bảo paths tồn tại."""
+        valid_labeled = set()
+        for idx in self.labeled_indices:
+            if idx < len(self.filtered_metadata):
+                meta = self.filtered_metadata[idx]
+                image_path = meta.get("image_path")
+                if image_path and Path(image_path).exists():
+                    valid_labeled.add(idx)
+                else:
+                    # Xóa khỏi unlabeled nếu đã được label nhưng path không tồn tại
+                    self.unlabeled_indices.discard(idx)
+            else:
+                self.unlabeled_indices.discard(idx)
+
+        self.valid_labeled_indices = valid_labeled
+        print(f"[VALIDATE] Valid labeled: {len(self.valid_labeled_indices)}/{len(self.labeled_indices)}")
+
     def run(self, metadata_path: str, image_dirs: List[str], output_dir: str = "results") -> pd.DataFrame:
         """
         Chạy full AL loop.
@@ -410,13 +438,14 @@ class ActiveLearningLoop:
                 self.load_checkpoint(checkpoint_path)
                 start_round = len(self.results_history)
                 print(f"[INFO] Resumed from round {start_round}")
-            except:
-                pass
-        
+            except Exception as e:
+                print(f"[WARNING] Failed to load checkpoint: {e}")
+                start_round = 0
+
         # Train initial round
         if start_round == 0:
             train_results = self.train_round(round_num=0)
-            
+
             self.results_history.append({
                 "round": 0,
                 "labeled_count": len(self.valid_labeled_indices),
@@ -424,8 +453,10 @@ class ActiveLearningLoop:
                 "map50_95": train_results.get("map50_95", 0.0),
                 "batch_diversity": {}
             })
-            
+
+            # LƯU CHECKPOINT NGAY SAU ROUND 0
             self.save_checkpoint(checkpoint_path)
+            print(f"[CHECKPOINT] Saved after round 0")
         
         # AL rounds
         for round_num in range(start_round + 1, self.num_rounds + 1):
