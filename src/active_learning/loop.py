@@ -11,6 +11,7 @@ import random
 import pickle
 import math
 import gc
+import numpy as np
 import torch  # Thêm cho memory management
 
 from sampling.uncertainty import calc_image_uncertainty
@@ -19,7 +20,9 @@ from sampling.baseline import baseline_sampling
 from training.trainer import YOLOTrainer
 from data.loader import (
     get_all_metadata,
+    get_all_metadata_cached,
     build_image_path_map,
+    build_image_path_map_cached,
     filter_images_with_labels,
     YOLO_CLASS_NAMES
 )
@@ -50,11 +53,16 @@ class ActiveLearningLoop:
         """
         
         self.experiment_name = experiment_name
-        
-        # Random seed
+
+        # Random seed - set cho cả 3 thư viện để reproducibility
         seed = config.get("seed", 42)
+        self.seed = seed
         random.seed(seed)
-        
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
         self.initial_budget = config.get("initial_budget", 500)
         self.batch_size = config.get("al_batch_size", 500)
         self.train_batch_size = config.get("train_batch_size", 16)
@@ -65,12 +73,39 @@ class ActiveLearningLoop:
         self.stratify_fields = config.get("stratify_fields", ["weather", "scene", "timeofday"])
         self.model_name = config.get("model_name", "yolov8n")
         self.use_baseline = config.get("use_baseline", False)
+
+        # Inference settings (tối ưu tốc độ cho AL loop)
+        # predict_batch_size: số ảnh xử lý mỗi lần gọi model
+        #   - 256 nhanh, an toàn về VRAM (Kaggle T4 16GB)
+        #   - 512 nhanh hơn nữa nếu đủ VRAM
+        # predict_imgsz: kích thước ảnh khi tính uncertainty
+        #   - 640 giống training -> nhất quán nhất (khuyến nghị)
+        #   - 320 nhanh gấp 2-3x, entropy chính xác hơn một chút
+        self.predict_batch_size = config.get("predict_batch_size", 256)
+        self.predict_imgsz = config.get("predict_imgsz", 640)
+
+        # Fixed held-out eval set
+        # eval_size: số ảnh dành cho đánh giá, bị loại khỏi pool labeled vĨNH VIỄN
+        #   - 0 = tắt (giữ hành vi cũ: val rút ngẫu nhiên từ labeled pool)
+        #   - 1000-2000 = đủ lớn để mAP ổn định, vẫn giữ ~60k ảnh cho AL
+        # eval_split_seed: seed CỐ ĐỊNH, tách biệt khỏi seed của experiment
+        #   -> eval set giống hệt nhau cho mọi pipeline và seed
+        self.eval_size = config.get("eval_size", 2000)
+        self.eval_split_seed = config.get("eval_split_seed", 2024)
+        # Thư mục chứa eval set dùng chung cho mọi round & experiment
+        # (copy 1 lần duy nhất, tiết kiệm ~3.6GB disk + thời gian I/O)
+        self.shared_eval_dir = config.get("shared_eval_dir", "data/processed/_shared_eval")
+
+        # Early stopping: số epoch không cải thiện thì dừng. 0 = tắt.
+        # Với dataset nhỏ (500-1500 ảnh) và chỉ 5 epochs, patience=3 là an toàn.
+        self.early_stop_patience = config.get("early_stop_patience", 0)
         
         # Models và data
         self.trainer = YOLOTrainer(
             model_name=self.model_name,
             device=self.device,
-            project_dir=f"experiments/runs/{experiment_name}"
+            project_dir=f"experiments/runs/{experiment_name}",
+            train_seed=seed,
         )
         
         self.all_metadata = []
@@ -81,6 +116,7 @@ class ActiveLearningLoop:
         self.labeled_indices = set()
         self.unlabeled_indices = set()
         self.valid_labeled_indices = set()
+        self.eval_indices = []
         
         # Results tracking
         self.results_history = []
@@ -97,11 +133,16 @@ class ActiveLearningLoop:
         print(f"[INIT] Loading metadata from {metadata_path}...")
         
         # Load metadata
-        self.all_metadata = get_all_metadata(metadata_path)
-        
+        # Cache metadata + image index giữa các experiments (tiết kiệm ~3.5 phút/run)
+        cache_dir = "data/cache"
+        metadata_cache = f"{cache_dir}/metadata_{Path(metadata_path).stem}.pkl"
+        path_cache = f"{cache_dir}/image_path_map.pkl"
+
+        self.all_metadata = get_all_metadata_cached(metadata_path, metadata_cache)
+
         # Build image path map
         print("[INIT] Building image path index...")
-        self.image_path_map = build_image_path_map(image_dirs)
+        self.image_path_map = build_image_path_map_cached(image_dirs, path_cache)
         
         # Add image paths to metadata
         for meta in self.all_metadata:
@@ -120,30 +161,43 @@ class ActiveLearningLoop:
 
         # Initialize all as unlabeled
         self.unlabeled_indices = set(range(len(valid_metadata)))
-        
+
+        # Tách EVAL SET cố định ra khỏi pool (không bao giờ được label/train).
+        # Dùng chung cho mọi experiment & seed => mAP comparable, không rò rỉ.
+        self.eval_indices = self._build_eval_set(valid_metadata)
+        eval_set = set(self.eval_indices)
+        self.unlabeled_indices -= eval_set
+
         # Chọn initial samples bằng stratified sampling
         print(f"[INIT] Total images: {len(valid_metadata)}")
+        print(f"[INIT] Eval set (held-out): {len(self.eval_indices)}")
         print(f"[INIT] Initial budget: {self.initial_budget}")
-        
-        initial_indices = stratified_sampling(
-            metadata_list=self.filtered_metadata,
-            uncertainty_scores={i: random.random() for i in range(len(valid_metadata))},
+
+        # Chỉ chọn trong pool đã loại eval set
+        pool_indices = sorted(self.unlabeled_indices)
+        pool_metadata = [self.filtered_metadata[i] for i in pool_indices]
+
+        initial_local = stratified_sampling(
+            metadata_list=pool_metadata,
+            uncertainty_scores={i: random.random() for i in range(len(pool_metadata))},
             batch_size=self.initial_budget,
             stratify_fields=self.stratify_fields
         )
-        
+        # Map local index -> global index
+        initial_indices = [pool_indices[i] for i in initial_local]
+
         self.labeled_indices = set(initial_indices)
         self.unlabeled_indices -= self.labeled_indices
-        
+
         # Track valid labeled samples
         for idx in initial_indices:
             meta = valid_metadata[idx]
             image_path = meta.get("image_path")
             if image_path and Path(image_path).exists():
                 self.valid_labeled_indices.add(idx)
-        
+
         print(f"[INIT] Selected {len(self.labeled_indices)} initial samples")
-        
+
         # Calculate initial diversity
         initial_metadata = [valid_metadata[i] for i in initial_indices]
         diversity = calculate_batch_diversity(
@@ -151,10 +205,37 @@ class ActiveLearningLoop:
             initial_indices,
             self.stratify_fields
         )
-        
+
         print(f"[INIT] Initial batch diversity:")
         for field, entropy in diversity.items():
             print(f"       - {field}: {entropy:.4f} bits")
+
+    def _build_eval_set(self, valid_metadata: List[Dict]) -> List[int]:
+        """
+        Tạo fixed held-out eval set, CỐ ĐỊNH cho mọi experiment/seed.
+
+        Dùng seed cố định (2024 - tách biệt khỏi seed của experiment) để đảm bảo
+        eval set luôn giống nhau -> so sánh mAP giữa các pipeline/seed là hợp lệ.
+
+        Ưu điểm so với val set rút ngẫu nhiên từ labeled pool mỗi round:
+        - mAP ở mọi round đo trên CÙNG tập ảnh -> comparable
+        - không rò rỉ (eval set không bao giờ vào train/labeled pool)
+        - val set nội bộ vẫn giữ 20% để early stopping vẫn hoạt động
+        """
+        eval_size = self.eval_size
+        if eval_size <= 0:
+            print("[INIT] Eval set disabled")
+            return []
+
+        # Sort theo filename để thứ tự deterministic
+        ordered = sorted(
+            range(len(valid_metadata)),
+            key=lambda i: str(valid_metadata[i].get("filename", ""))
+        )
+
+        rng = random.Random(self.eval_split_seed)
+        chosen = rng.sample(ordered, min(eval_size, len(ordered)))
+        return sorted(chosen)
     
     def train_round(self, round_num: int) -> Dict:
         """
@@ -187,12 +268,21 @@ class ActiveLearningLoop:
         labeled_metadata, image_paths = zip(*valid_pairs)
         labeled_metadata = list(labeled_metadata)
         image_paths = list(image_paths)
-        
+
+        # Eval set cố định (nếu có) - dùng để báo cáo mAP comparable giữa các round
+        eval_paths, eval_metadata = None, None
+        if self.eval_indices:
+            eval_metadata = [self.filtered_metadata[i] for i in self.eval_indices]
+            eval_paths = [m.get("image_path") for m in eval_metadata]
+
         dataset_yaml = self.trainer.prepare_dataset_with_metadata(
             image_paths=image_paths,
             metadata_list=labeled_metadata,
             output_dir=f"data/processed/{self.experiment_name}/round_{round_num}",
-            split_seed=42
+            split_seed=42,
+            eval_paths=eval_paths,
+            eval_metadata=eval_metadata,
+            shared_eval_dir=self.shared_eval_dir,
         )
         
         save_name = f"round_{round_num}"
@@ -204,7 +294,8 @@ class ActiveLearningLoop:
             epochs=self.epochs,
             batch_size = self.train_batch_size,
             imgsz=640,
-            save_name=save_name
+            save_name=save_name,
+            patience=self.early_stop_patience,
         )
         
         print(f"[ROUND {round_num}] Training complete!")
@@ -218,6 +309,126 @@ class ActiveLearningLoop:
 
         return train_results
     
+    def _predict_uncertainty(
+        self,
+        image_paths: List[str],
+        indices: List[int],
+        batch_size: int = None,
+    ) -> Dict[int, float]:
+        """
+        Dự đoán uncertainty cho toàn bộ ảnh chưa label, tối ưu tốc độ.
+
+        Tối ưu so với phiên bản cũ:
+        - batch lớn hơn nhiều (mặc định 256 thay vì 32) -> giảm số lần gọi model
+        - `stream=True` -> không giữ toàn bộ Results objects trong RAM
+        - `half=True` (FP16) -> inference nhanh gấp đôi trên GPU
+        - gc.collect() chỉ gọi mỗi ~50 batch thay vì mỗi batch
+        - `rect=True` -> ít padding, nhanh hơn
+
+        Args:
+            image_paths: Danh sách đường dẫn ảnh
+            indices: Index tương ứng trong metadata
+            batch_size: Batch size cho inference (None = dùng config)
+        """
+        scores: Dict[int, float] = {}
+        max_entropy = math.log2(self.num_classes)
+
+        if batch_size is None:
+            batch_size = self.predict_batch_size
+        imgsz = self.predict_imgsz
+
+        device_arg = self.device
+
+        try:
+            # stream=True: generator, chỉ giữ 1 batch trong RAM
+            results_iter = self.trainer.model.predict(
+                source=image_paths,
+                batch=batch_size,
+                imgsz=imgsz,
+                stream=True,
+                verbose=False,
+                half=True,          # FP16 -> nhanh gấp ~2x
+                device=device_arg,
+                rect=True,          # inference rect: ít padding -> nhanh hơn
+                conf=0.001,         # giữ ngưỡng thấp để tính entropy đầy đủ
+                iou=0.7,
+                max_det=300,
+            )
+
+            processed = 0
+            for result in results_iter:
+                idx = indices[processed] if processed < len(indices) else None
+                if idx is not None:
+                    if result is None:
+                        scores[idx] = max_entropy
+                    else:
+                        scores[idx] = calc_image_uncertainty(result, self.num_classes)
+                processed += 1
+
+                if processed % 5000 == 0:
+                    print(f"      Processed {processed}/{len(image_paths)} images", flush=True)
+
+            # Trường hợp stream trả về ít hơn dự kiến
+            for i in range(processed, len(indices)):
+                scores[indices[i]] = max_entropy
+
+        except Exception as e:
+            print(f"[WARNING] Batch predict failed ({e}), retrying per-chunk")
+            # Fallback: chia nhỏ hơn và gọi lại
+            scores = self._predict_uncertainty_chunked(image_paths, indices)
+
+        return scores
+
+    def _predict_uncertainty_chunked(
+        self,
+        image_paths: List[str],
+        indices: List[int],
+        chunk_size: int = 512,
+    ) -> Dict[int, float]:
+        """Fallback: predict theo chunk lớn, không dùng stream."""
+        scores: Dict[int, float] = {}
+        max_entropy = math.log2(self.num_classes)
+        imgsz = self.predict_imgsz
+
+        for start in range(0, len(image_paths), chunk_size):
+            chunk_paths = image_paths[start:start + chunk_size]
+            chunk_indices = indices[start:start + chunk_size]
+
+            try:
+                batch_results = self.trainer.model.predict(
+                    source=chunk_paths,
+                    batch=len(chunk_paths),
+                    imgsz=imgsz,
+                    verbose=False,
+                    half=True,
+                    device=self.device,
+                    rect=True,
+                    conf=0.001,
+                    iou=0.7,
+                    max_det=300,
+                )
+            except Exception as e:
+                print(f"[WARNING] Chunk {start} failed: {e}")
+                for idx in chunk_indices:
+                    scores[idx] = max_entropy
+                continue
+
+            if not isinstance(batch_results, list):
+                batch_results = [batch_results]
+
+            for idx, result in zip(chunk_indices, batch_results):
+                if result is None:
+                    scores[idx] = max_entropy
+                else:
+                    scores[idx] = calc_image_uncertainty(result, self.num_classes)
+
+            del batch_results
+            if (start // chunk_size) % 10 == 0:
+                gc.collect()
+                print(f"      Processed {min(start + chunk_size, len(image_paths))}/{len(image_paths)} images", flush=True)
+
+        return scores
+
     def select_batch(self, round_num: int) -> List[int]:
         """
         Chọn batch mới để label bằng stratified sampling.
@@ -247,45 +458,16 @@ class ActiveLearningLoop:
         for idx in unlabeled_list:
             meta = self.filtered_metadata[idx]
             image_path = meta.get("image_path")
-            if image_path and Path(image_path).exists():
+            if image_path:
                 valid_image_paths.append(image_path)
                 valid_indices.append(idx)
         
         print(f"[ROUND {round_num}] Predicting {len(valid_image_paths)} images...")
-        
-        # Compute uncertainty in batches - TĂNG BATCH SIZE ĐỂ NHANH HƠN
-        batch_size = 32  # 32 thay vì 4 - KHÔNG ảnh hưởng chất lượng, chỉ nhanh hơn
-        
+
         try:
-            for batch_start in range(0, len(valid_image_paths), batch_size):
-                batch_end = min(batch_start + batch_size, len(valid_image_paths))
-                batch_paths = valid_image_paths[batch_start:batch_end]
-                batch_indices = valid_indices[batch_start:batch_end]
-                
-                # Predict batch
-                batch_results = self.trainer.model.predict(
-                    source=batch_paths,
-                    batch=len(batch_paths),
-                    verbose=False
-                )
-                
-                # Process results immediately
-                for idx, result in zip(batch_indices, batch_results):
-                    if result is None:
-                        uncertainty_scores[idx] = math.log2(self.num_classes)
-                    else:
-                        if isinstance(result, list):
-                            result = result[0]
-                        uncertainty_scores[idx] = calc_image_uncertainty(result, self.num_classes)
-                
-                # Clear GPU memory after each small batch
-                del batch_results
-                gc.collect()
-                if batch_start % 2000 == 0 and batch_start > 0:
-                    print(f"      Processed {batch_start}/{len(valid_image_paths)} images")
-            
-            print(f"      Processed {len(valid_image_paths)}/{len(valid_image_paths)} images")
-            
+            uncertainty_scores.update(
+                self._predict_uncertainty(valid_image_paths, valid_indices)
+            )
         except Exception as e:
             print(f"[WARNING] Prediction failed: {e}")
             # Fallback: random uncertainty
@@ -353,18 +535,27 @@ class ActiveLearningLoop:
         print(f"[UPDATE] Remaining unlabeled: {len(self.unlabeled_indices)}")
 
     def save_checkpoint(self, path: str):
-        """Save checkpoint."""
+        """Save checkpoint (state của AL loop + đường dẫn model weights)."""
         checkpoint = {
             "labeled_indices": list(self.labeled_indices),
             "unlabeled_indices": list(self.unlabeled_indices),
             "valid_labeled_indices": list(self.valid_labeled_indices),
             "results_history": self.results_history,
             "filtered_metadata": self.filtered_metadata,
-            "all_metadata": self.all_metadata
+            "all_metadata": self.all_metadata,
+            "eval_indices": self.eval_indices,
+            # Đường dẫn tới weights của round vừa rồi để resume warm-start
+            "best_model_path": self.trainer.best_model_path,
+            "config": {
+                "seed": self.seed,
+                "use_baseline": self.use_baseline,
+                "num_rounds": self.num_rounds,
+                "epochs": self.epochs,
+            },
         }
-        
+
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(path, "wb") as f:
             pickle.dump(checkpoint, f)
 
@@ -379,6 +570,17 @@ class ActiveLearningLoop:
         self.results_history = checkpoint["results_history"]
         self.filtered_metadata = checkpoint.get("filtered_metadata", [])
         self.all_metadata = checkpoint["all_metadata"]
+        self.eval_indices = checkpoint.get("eval_indices", [])
+
+        # Khôi phục model weights để warm-start từ round trước
+        best_model_path = checkpoint.get("best_model_path")
+        if best_model_path and Path(best_model_path).exists():
+            self.trainer.best_model_path = best_model_path
+            self.trainer.load_model(best_model_path)
+            print(f"[CHECKPOINT] Restored model weights: {best_model_path}")
+        else:
+            print(f"[WARNING] Không tìm thấy weights '{best_model_path}', "
+                  f"sẽ train lại từ pretrained")
 
         # Re-validate paths sau khi load checkpoint
         self._validate_labeled_indices()
@@ -433,7 +635,7 @@ class ActiveLearningLoop:
         
         # initial training
         start_round = 0
-        if Path(checkpoint_path).exists() and len(self.results_history) > 0:
+        if Path(checkpoint_path).exists():
             try:
                 self.load_checkpoint(checkpoint_path)
                 start_round = len(self.results_history)
@@ -446,12 +648,20 @@ class ActiveLearningLoop:
         if start_round == 0:
             train_results = self.train_round(round_num=0)
 
+            # Diversity của initial batch (round 0) - quan trọng cho phân tích tương quan
+            initial_diversity = calculate_batch_diversity(
+                self.filtered_metadata,
+                list(self.valid_labeled_indices),
+                self.stratify_fields
+            )
+
             self.results_history.append({
                 "round": 0,
                 "labeled_count": len(self.valid_labeled_indices),
-                "map50": train_results.get("map50", 0.0),
-                "map50_95": train_results.get("map50_95", 0.0),
-                "batch_diversity": {}
+                "map50": train_results.get("eval_map50", train_results.get("map50", 0.0)),
+                "map50_95": train_results.get("eval_map50_95", train_results.get("map50_95", 0.0)),
+                "val_map50": train_results.get("map50", 0.0),
+                "batch_diversity": initial_diversity
             })
 
             # LƯU CHECKPOINT NGAY SAU ROUND 0
@@ -484,8 +694,9 @@ class ActiveLearningLoop:
             self.results_history.append({
                 "round": round_num,
                 "labeled_count": len(self.valid_labeled_indices),
-                "map50": train_results.get("map50", 0.0),
-                "map50_95": train_results.get("map50_95", 0.0),
+                "map50": train_results.get("eval_map50", train_results.get("map50", 0.0)),
+                "map50_95": train_results.get("eval_map50_95", train_results.get("map50_95", 0.0)),
+                "val_map50": train_results.get("map50", 0.0),
                 "batch_diversity": diversity
             })
             

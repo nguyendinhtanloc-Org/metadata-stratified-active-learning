@@ -6,6 +6,7 @@ Convert box2d → YOLO format.
 
 import json
 import os
+import pickle
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -138,6 +139,79 @@ def build_image_path_map(base_dirs: List[str]) -> Dict[str, str]:
                     path_map[f] = os.path.join(root, f)
 
     return path_map
+
+
+def build_image_path_map_cached(base_dirs: List[str], cache_path: str = None) -> Dict[str, str]:
+    """
+    Tương tự build_image_path_map nhưng cache kết quả ra disk.
+
+    os.walk trên 100k ảnh mất ~2 phút; gọi lại 6 lần cho 6 experiments
+    là 12 phút lãng phí. Cache giúp chỉ walk 1 lần.
+
+    Args:
+        base_dirs: Danh sách thư mục base
+        cache_path: Đường dẫn file cache (pickle). None = không cache.
+
+    Returns:
+        Dict {filename: full_path}
+    """
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            print(f"[CACHE] Loaded image path index from {cache_path} ({len(cached)} entries)")
+            return cached
+        except Exception as e:
+            print(f"[CACHE] Failed to load cache ({e}), rebuilding...")
+
+    path_map = build_image_path_map(base_dirs)
+
+    if cache_path:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(path_map, f)
+            print(f"[CACHE] Saved image path index to {cache_path}")
+        except Exception as e:
+            print(f"[CACHE] Failed to save cache: {e}")
+
+    return path_map
+
+
+def get_all_metadata_cached(metadata_path: str, cache_path: str = None) -> List[dict]:
+    """
+    Tương tự get_all_metadata nhưng cache kết quả ra disk.
+
+    Parse JSON 200MB mất ~30 giây; cache giúp tiết kiệm cho các runs sau.
+
+    Args:
+        metadata_path: Đường dẫn file JSON metadata
+        cache_path: Đường dẫn file cache (pickle)
+
+    Returns:
+        List[dict] metadata
+    """
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            print(f"[CACHE] Loaded metadata from {cache_path} ({len(cached)} entries)")
+            return cached
+        except Exception as e:
+            print(f"[CACHE] Failed to load metadata cache ({e}), re-parsing...")
+
+    metadata = get_all_metadata(metadata_path)
+
+    if cache_path:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(metadata, f)
+            print(f"[CACHE] Saved metadata to {cache_path}")
+        except Exception as e:
+            print(f"[CACHE] Failed to save metadata cache: {e}")
+
+    return metadata
 
 
 def filter_images_with_labels(metadata_list: List[dict], image_path_map: Dict[str, str]) -> List[dict]:
