@@ -11,6 +11,9 @@ import random
 import pickle
 import math
 import gc
+import os
+import shutil
+import warnings
 import numpy as np
 import torch  # Thêm cho memory management
 
@@ -84,6 +87,14 @@ class ActiveLearningLoop:
         self.predict_batch_size = config.get("predict_batch_size", 256)
         self.predict_imgsz = config.get("predict_imgsz", 640)
 
+        # local_image_cache: cache ảnh vào local disk (SSD) để inference nhanh hơn
+        #   - None = tắt (đọc trực tiếp từ /kaggle/input)
+        #   - "data/local_images" = copy 1 lần rồi đọc từ local disk
+        # Lý do: đọc ảnh từ /kaggle/input là network-backed storage, chậm hơn
+        # nhiều lần so với local SSD (đo thực tế trên Kaggle T4: GPU inference
+        # chỉ 2ms/ảnh nhưng tổng thời gian là 160ms/ảnh -> 98% là I/O).
+        self.local_image_cache = config.get("local_image_cache", None)
+
         # Fixed held-out eval set
         # eval_size: số ảnh dành cho đánh giá, bị loại khỏi pool labeled vĨNH VIỄN
         #   - 0 = tắt (giữ hành vi cũ: val rút ngẫu nhiên từ labeled pool)
@@ -121,6 +132,41 @@ class ActiveLearningLoop:
         # Results tracking
         self.results_history = []
         
+    def _cache_images_locally(self, metadata_list: List[dict]) -> int:
+        """
+        Copy ảnh từ /kaggle/input sang local disk (/kaggle/working) một lần.
+
+        Sau khi copy, các lần predict sau (và các experiment sau trong cùng
+        session) đọc từ local disk -> nhanh hơn nhiều lần.
+
+        Returns:
+            Số ảnh đã copy.
+        """
+        cache_root = Path(self.local_image_cache)
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        copied = 0
+        skipped = 0
+        for meta in metadata_list:
+            src = meta.get("image_path")
+            if not src:
+                continue
+            dst = cache_root / os.path.basename(src)
+            if dst.exists():
+                meta["image_path"] = str(dst)
+                skipped += 1
+                continue
+            try:
+                shutil.copy(src, dst)
+                meta["image_path"] = str(dst)
+                copied += 1
+            except Exception:
+                pass  # giữ nguyên path gốc nếu copy lỗi
+
+        print(f"[CACHE] Local image cache: {copied} copied, {skipped} already present")
+        print(f"[CACHE] Location: {cache_root}")
+        return copied
+
     def initialize(self, metadata_path: str, image_dirs: List[str]):
         """
         Khởi tạo dataset và chọn initial samples.
@@ -155,6 +201,10 @@ class ActiveLearningLoop:
         # Filter images with labels
         self.filtered_metadata = filter_images_with_labels(self.all_metadata, self.image_path_map)
         valid_metadata = self.filtered_metadata
+
+        # Cache ảnh vào local disk nếu được cấu hình (tăng tốc inference)
+        if self.local_image_cache:
+            self._cache_images_locally(valid_metadata)
 
         print(f"[INIT] Found {len(self.all_metadata)} images")
         print(f"[INIT] Valid samples: {len(valid_metadata)}/{len(self.all_metadata)}")
@@ -339,43 +389,50 @@ class ActiveLearningLoop:
 
         device_arg = self.device
 
-        try:
-            # stream=True: generator, chỉ giữ 1 batch trong RAM
-            results_iter = self.trainer.model.predict(
-                source=image_paths,
-                batch=batch_size,
-                imgsz=imgsz,
-                stream=True,
-                verbose=False,
-                half=True,          # FP16 -> nhanh gấp ~2x
-                device=device_arg,
-                rect=True,          # inference rect: ít padding -> nhanh hơn
-                conf=0.001,         # giữ ngưỡng thấp để tính entropy đầy đủ
-                iou=0.7,
-                max_det=300,
-            )
+        # half=True: ultralytics >=8.4 warns "'half' is deprecated, use
+        # 'quantize'". The flag still works, so keep it and silence the warning
+        # instead of switching flags (semantics of 'quantize' vary across
+        # versions and cannot be verified here). The whole block is wrapped
+        # because stream=True is lazy - the warning may fire during iteration.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*half.*deprecated.*")
+            try:
+                # stream=True: generator, chỉ giữ 1 batch trong RAM
+                results_iter = self.trainer.model.predict(
+                    source=image_paths,
+                    batch=batch_size,
+                    imgsz=imgsz,
+                    stream=True,
+                    verbose=False,
+                    half=True,          # FP16 -> nhanh gấp ~2x
+                    device=device_arg,
+                    rect=True,          # inference rect: ít padding -> nhanh hơn
+                    conf=0.001,         # giữ ngưỡng thấp để tính entropy đầy đủ
+                    iou=0.7,
+                    max_det=300,
+                )
 
-            processed = 0
-            for result in results_iter:
-                idx = indices[processed] if processed < len(indices) else None
-                if idx is not None:
-                    if result is None:
-                        scores[idx] = max_entropy
-                    else:
-                        scores[idx] = calc_image_uncertainty(result, self.num_classes)
-                processed += 1
+                processed = 0
+                for result in results_iter:
+                    idx = indices[processed] if processed < len(indices) else None
+                    if idx is not None:
+                        if result is None:
+                            scores[idx] = max_entropy
+                        else:
+                            scores[idx] = calc_image_uncertainty(result, self.num_classes)
+                    processed += 1
 
-                if processed % 5000 == 0:
-                    print(f"      Processed {processed}/{len(image_paths)} images", flush=True)
+                    if processed % 5000 == 0:
+                        print(f"      Processed {processed}/{len(image_paths)} images", flush=True)
 
-            # Trường hợp stream trả về ít hơn dự kiến
-            for i in range(processed, len(indices)):
-                scores[indices[i]] = max_entropy
+                # Trường hợp stream trả về ít hơn dự kiến
+                for i in range(processed, len(indices)):
+                    scores[indices[i]] = max_entropy
 
-        except Exception as e:
-            print(f"[WARNING] Batch predict failed ({e}), retrying per-chunk")
-            # Fallback: chia nhỏ hơn và gọi lại
-            scores = self._predict_uncertainty_chunked(image_paths, indices)
+            except Exception as e:
+                print(f"[WARNING] Batch predict failed ({e}), retrying per-chunk")
+                # Fallback: chia nhỏ hơn và gọi lại
+                scores = self._predict_uncertainty_chunked(image_paths, indices)
 
         return scores
 
