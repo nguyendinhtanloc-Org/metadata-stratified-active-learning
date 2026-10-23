@@ -621,6 +621,9 @@ class ActiveLearningLoop:
             self.initialize(metadata_path, image_dirs)
         
         # Tạo output directory
+        # Cấu trúc: results/<experiment_name>/  -> chứa results.csv + checkpoint.pkl
+        # (khớp với glob của cell save/restore trong notebook:
+        #  results/main_experiment/*/checkpoint.pkl)
         output_path = Path(output_dir) / self.experiment_name
         output_path.mkdir(parents=True, exist_ok=True)
         
