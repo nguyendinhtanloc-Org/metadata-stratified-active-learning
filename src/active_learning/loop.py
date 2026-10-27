@@ -389,50 +389,52 @@ class ActiveLearningLoop:
 
         device_arg = self.device
 
-        # half=True: ultralytics >=8.4 warns "'half' is deprecated, use
-        # 'quantize'". The flag still works, so keep it and silence the warning
-        # instead of switching flags (semantics of 'quantize' vary across
-        # versions and cannot be verified here). The whole block is wrapped
-        # because stream=True is lazy - the warning may fire during iteration.
+        # Chia source thành các slice: với source = list 59k đường dẫn,
+        # dataloader của ultralytics sẽ prefetch dữ liệu cho TOÀN bộ list
+        # (8 workers x prefetch x 256) -> ~25GB RAM, gây OOM "Kernel died".
+        # Mỗi slice 4096 ảnh giới hạn dữ liệu in-flight, vẫn giữ tốc độ.
+        # half=True: ultralytics >=8.4 warn "'half' is deprecated" -> giữ flag
+        # (vẫn hoạt động) và chặn warning thay vì đổi sang 'quantize'.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*half.*deprecated.*")
-            try:
-                # stream=True: generator, chỉ giữ 1 batch trong RAM
-                results_iter = self.trainer.model.predict(
-                    source=image_paths,
-                    batch=batch_size,
-                    imgsz=imgsz,
-                    stream=True,
-                    verbose=False,
-                    half=True,          # FP16 -> nhanh gấp ~2x
-                    device=device_arg,
-                    rect=True,          # inference rect: ít padding -> nhanh hơn
-                    conf=0.001,         # giữ ngưỡng thấp để tính entropy đầy đủ
-                    iou=0.7,
-                    max_det=300,
-                )
+            processed = 0
+            for slice_start in range(0, len(image_paths), 4096):
+                sl_paths = image_paths[slice_start:slice_start + 4096]
+                sl_idx = indices[slice_start:slice_start + 4096]
+                try:
+                    results_iter = self.trainer.model.predict(
+                        source=sl_paths,
+                        batch=batch_size,
+                        imgsz=imgsz,
+                        stream=True,
+                        verbose=False,
+                        half=True,          # FP16 -> nhanh gấp ~2x
+                        device=device_arg,
+                        rect=True,          # inference rect: ít padding -> nhanh hơn
+                        conf=0.001,         # giữ ngưỡng thấp để tính entropy đầy đủ
+                        iou=0.7,
+                        max_det=300,
+                    )
+                    for k, result in enumerate(results_iter):
+                        idx = sl_idx[k] if k < len(sl_idx) else None
+                        if idx is not None:
+                            scores[idx] = (max_entropy if result is None
+                                           else calc_image_uncertainty(result, self.num_classes))
+                    processed += len(sl_idx)
+                    del results_iter
+                except Exception as e:
+                    print(f"[WARNING] Slice {slice_start}-{slice_start+len(sl_idx)} "
+                          f"predict failed ({e}) -> dùng entropy cao nhất")
+                    for idx in sl_idx:
+                        scores[idx] = max_entropy
+                    processed += len(sl_idx)
 
-                processed = 0
-                for result in results_iter:
-                    idx = indices[processed] if processed < len(indices) else None
-                    if idx is not None:
-                        if result is None:
-                            scores[idx] = max_entropy
-                        else:
-                            scores[idx] = calc_image_uncertainty(result, self.num_classes)
-                    processed += 1
+                if processed % 8000 < 4096:
+                    print(f"      Processed {processed}/{len(image_paths)} images", flush=True)
 
-                    if processed % 5000 == 0:
-                        print(f"      Processed {processed}/{len(image_paths)} images", flush=True)
-
-                # Trường hợp stream trả về ít hơn dự kiến
-                for i in range(processed, len(indices)):
-                    scores[indices[i]] = max_entropy
-
-            except Exception as e:
-                print(f"[WARNING] Batch predict failed ({e}), retrying per-chunk")
-                # Fallback: chia nhỏ hơn và gọi lại
-                scores = self._predict_uncertainty_chunked(image_paths, indices)
+                # GC giữa các slice để tránh tích lũy bộ nhớ
+                if slice_start % 20000 == 0 and slice_start > 0:
+                    gc.collect()
 
         return scores
 
