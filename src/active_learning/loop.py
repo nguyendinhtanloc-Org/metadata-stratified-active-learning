@@ -430,7 +430,15 @@ class ActiveLearningLoop:
                     processed += len(sl_idx)
 
                 if processed % 8000 < 4096:
-                    print(f"      Processed {processed}/{len(image_paths)} images", flush=True)
+                    mem_info = ""
+                    try:
+                        import psutil
+                        rss_gb = psutil.Process().memory_info().rss / 1e9
+                        avail_gb = psutil.virtual_memory().available / 1e9
+                        mem_info = f" [MEM] rss={rss_gb:.1f}GB avail={avail_gb:.1f}GB"
+                    except Exception:
+                        pass
+                    print(f"      Processed {processed}/{len(image_paths)} images{mem_info}", flush=True)
 
                 # GC giữa các slice để tránh tích lũy bộ nhớ
                 if slice_start % 20000 == 0 and slice_start > 0:
