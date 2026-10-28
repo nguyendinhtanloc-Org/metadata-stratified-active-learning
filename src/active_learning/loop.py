@@ -389,47 +389,43 @@ class ActiveLearningLoop:
 
         device_arg = self.device
 
-        # Chia source thành các slice: với source = list 59k đường dẫn,
-        # dataloader của ultralytics sẽ prefetch dữ liệu cho TOÀN bộ list
-        # (8 workers x prefetch x 256) -> ~25GB RAM, gây OOM "Kernel died".
-        # Mỗi slice 4096 ảnh giới hạn dữ liệu in-flight, vẫn giữ tốc độ.
-        # half=True: ultralytics >=8.4 warn "'half' is deprecated" -> giữ flag
-        # (vẫn hoạt động) và chặn warning thay vì đổi sang 'quantize'.
+        # CHUYEN PHUONG: doc DAY DU danh sach source trong 1 goi predict (stream).
+        # Ly do: 3 lan chay 28-29/10 voi phien ban "slice 4096" deu bi
+        # "Kernel died" (6.4p / 9.3p / 53s sau predict bat dau) - moi slice
+        # la 1 lan goi predict() moi -> dataloader + CUDA context tao lai
+        # tung slice -> bo nho tang dan den OOM. Phien ban list-don da
+        # CHUNG MINH so 3.8h (log 21/10, cung T4 32GB + ultralytics 8.4.184).
+        # Do do: 1 lan goi predict() duy nhat, stream=True giu RAM that thap,
+        # va log RAM moi 5000 anh de giam sat.
+        # half=True: ultralytics >=8.4 warn "'half' is deprecated" -> giu flag
+        # (van hoat dong) va chan warning thay vi doi sang 'quantize'.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*half.*deprecated.*")
-            processed = 0
-            for slice_start in range(0, len(image_paths), 4096):
-                sl_paths = image_paths[slice_start:slice_start + 4096]
-                sl_idx = indices[slice_start:slice_start + 4096]
-                try:
-                    results_iter = self.trainer.model.predict(
-                        source=sl_paths,
-                        batch=batch_size,
-                        imgsz=imgsz,
-                        stream=True,
-                        verbose=False,
-                        half=True,          # FP16 -> nhanh gấp ~2x
-                        device=device_arg,
-                        rect=True,          # inference rect: ít padding -> nhanh hơn
-                        conf=0.001,         # giữ ngưỡng thấp để tính entropy đầy đủ
-                        iou=0.7,
-                        max_det=300,
-                    )
-                    for k, result in enumerate(results_iter):
-                        idx = sl_idx[k] if k < len(sl_idx) else None
-                        if idx is not None:
-                            scores[idx] = (max_entropy if result is None
-                                           else calc_image_uncertainty(result, self.num_classes))
-                    processed += len(sl_idx)
-                    del results_iter
-                except Exception as e:
-                    print(f"[WARNING] Slice {slice_start}-{slice_start+len(sl_idx)} "
-                          f"predict failed ({e}) -> dùng entropy cao nhất")
-                    for idx in sl_idx:
-                        scores[idx] = max_entropy
-                    processed += len(sl_idx)
+            results_iter = self.trainer.model.predict(
+                source=image_paths,
+                batch=batch_size,
+                imgsz=imgsz,
+                stream=True,
+                verbose=False,
+                half=True,          # FP16 -> nhanh gap ~2x
+                device=device_arg,
+                rect=True,          # inference rect: it padding -> nhanh hon
+                conf=0.001,         # giu nguong thap de tinh entropy day du
+                iou=0.7,
+                max_det=300,
+            )
 
-                if processed % 8000 < 4096:
+            processed = 0
+            for result in results_iter:
+                idx = indices[processed] if processed < len(indices) else None
+                if idx is not None:
+                    if result is None:
+                        scores[idx] = max_entropy
+                    else:
+                        scores[idx] = calc_image_uncertainty(result, self.num_classes)
+                processed += 1
+
+                if processed % 5000 == 0:
                     mem_info = ""
                     try:
                         import psutil
@@ -440,9 +436,9 @@ class ActiveLearningLoop:
                         pass
                     print(f"      Processed {processed}/{len(image_paths)} images{mem_info}", flush=True)
 
-                # GC giữa các slice để tránh tích lũy bộ nhớ
-                if slice_start % 20000 == 0 and slice_start > 0:
-                    gc.collect()
+            # TRUONG HOP stream tra ve it hon du kien (an toan)
+            for i in range(processed, len(indices)):
+                scores[indices[i]] = max_entropy
 
         return scores
 
