@@ -85,6 +85,13 @@ class ActiveLearningLoop:
         #   - 640 giống training -> nhất quán nhất (khuyến nghị)
         #   - 320 nhanh gấp 2-3x, entropy chính xác hơn một chút
         self.predict_batch_size = config.get("predict_batch_size", 256)
+        # predict_workers: số dataloader workers của ultralytics khi predict.
+        # DEFAULT ultralytics = 8 worker. Mỗi worker prefetch (prefetch_factor
+        # batches) ảnh decode full-res (~11MB/ảnh x 256 x 2) -> với 8 worker
+        # queue in-flight ~39GB, VUOT RAM T4 x1 (34GB) => OOM "Kernel died".
+        # 2 worker -> ~16GB, an toàn; tốc độ giảm nhẹ (I/O-bound, không
+        # ảnh hưởng GPU inference).
+        self.predict_workers = config.get("predict_workers", 2)
         self.predict_imgsz = config.get("predict_imgsz", 640)
 
         # local_image_cache: cache ảnh vào local disk (SSD) để inference nhanh hơn
@@ -413,6 +420,7 @@ class ActiveLearningLoop:
                 conf=0.001,         # giu nguong thap de tinh entropy day du
                 iou=0.7,
                 max_det=300,
+                workers=self.predict_workers,  # 2 thay vi 8 (default) -> giam RAM
             )
 
             processed = 0
@@ -469,6 +477,7 @@ class ActiveLearningLoop:
                     conf=0.001,
                     iou=0.7,
                     max_det=300,
+                    workers=self.predict_workers,
                 )
             except Exception as e:
                 print(f"[WARNING] Chunk {start} failed: {e}")
