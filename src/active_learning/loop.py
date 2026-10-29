@@ -366,6 +366,24 @@ class ActiveLearningLoop:
 
         return train_results
     
+    @staticmethod
+    def _trim_memory():
+        """Ép GC + CUDA + glibc trả RAM thật sự về OS (chống RSS phình).
+
+        Kaggle OOM Killer đọc CGROUP memory (32.2GB) chứ không phải RSS
+        'available' của psutil. glibc malloc giữ lại heap cache đã giải
+        phóng -> RSS không về xuống -> cgroup đếm lố -> killed.
+        malloc_trim(0) ép glibc trả lại toàn bộ.
+        """
+        import ctypes
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
     def _predict_uncertainty(
         self,
         image_paths: List[str],
@@ -406,47 +424,76 @@ class ActiveLearningLoop:
         # va log RAM moi 5000 anh de giam sat.
         # half=True: ultralytics >=8.4 warn "'half' is deprecated" -> giu flag
         # (van hoat dong) va chan warning thay vi doi sang 'quantize'.
+        # CHIEN LUOC RAM co GIOI HAN (Kaggle cgroup = 32.2GB):
+        # - predict theo chunk 4096 anh -> dataloader chi dat hang 4096 duong dan
+        # - GIẢI PHÓNG result.orig_img / results ngay khi tieu thu (mỗi Results
+        #   giữ orig_img full-res ~2.8MB -> 59k Results = ~165GB, là thủ phạm chính)
+        # - _trim_memory() (gc + cuda.empty_cache + malloc_trim) cuỗi mỗi chunk
+        #   -> RSS thật sự hạ xuống, không phình dần cho đến khi OOM
+        # - workers=0 (đọc ảnh ở main process, tránh CoW leak của multiprocessing)
+        # - batch=128 giữ tốc độ GPU gần như không đổi (I/O-bound)
+        PREDICT_CHUNK = 4096
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*half.*deprecated.*")
-            results_iter = self.trainer.model.predict(
-                source=image_paths,
-                batch=batch_size,
-                imgsz=imgsz,
-                stream=True,
-                verbose=False,
-                half=True,          # FP16 -> nhanh gap ~2x
-                device=device_arg,
-                rect=True,          # inference rect: it padding -> nhanh hon
-                conf=0.001,         # giu nguong thap de tinh entropy day du
-                iou=0.7,
-                max_det=300,
-                workers=self.predict_workers,  # 2 thay vi 8 (default) -> giam RAM
-            )
-
             processed = 0
-            for result in results_iter:
-                idx = indices[processed] if processed < len(indices) else None
-                if idx is not None:
-                    if result is None:
+            for chunk_start in range(0, len(image_paths), PREDICT_CHUNK):
+                ck_paths = image_paths[chunk_start:chunk_start + PREDICT_CHUNK]
+                ck_idx = indices[chunk_start:chunk_start + PREDICT_CHUNK]
+                try:
+                    results_iter = self.trainer.model.predict(
+                        source=ck_paths,
+                        batch=batch_size,
+                        imgsz=imgsz,
+                        stream=True,
+                        verbose=False,
+                        half=True,
+                        device=device_arg,
+                        rect=True,
+                        conf=0.001,
+                        iou=0.7,
+                        max_det=300,
+                        workers=0,      # KHÔNG dataloader workers -> tranh CoW leak
+                    )
+                    for k, result in enumerate(results_iter):
+                        idx = ck_idx[k] if k < len(ck_idx) else None
+                        if idx is not None:
+                            if result is None:
+                                scores[idx] = max_entropy
+                            else:
+                                scores[idx] = calc_image_uncertainty(result, self.num_classes)
+                                # GIẢI PHÓNG ảnh gốc GIỮNG SÁT (tỗi mỗi ảnh, không đợi cuỗi chunk)
+                                for attr in ("orig_img", "names", "path"):
+                                    try:
+                                        setattr(result, attr, None)
+                                    except Exception:
+                                        pass
+                        del result
+                    del results_iter
+                    processed += len(ck_idx)
+                except Exception as e:
+                    print(f"[WARNING] Chunk {chunk_start}-{chunk_start+len(ck_idx)} predict "
+                          f"failed ({e}) -> dùng entropy cao nhất", flush=True)
+                    for idx in ck_idx:
                         scores[idx] = max_entropy
-                    else:
-                        scores[idx] = calc_image_uncertainty(result, self.num_classes)
-                processed += 1
+                    processed += len(ck_idx)
 
-                if processed % 1000 == 0:
-                    mem_info = ""
+                # ÉP RAM hoàn trả về OS cuỗi mỗi chunk (quan trọng nhất)
+                self._trim_memory()
+
+                mem_info = ""
+                try:
+                    import psutil
+                    rss_gb = psutil.Process().memory_info().rss / 1e9
+                    cgroup_limit = None
                     try:
-                        import psutil
-                        rss_gb = psutil.Process().memory_info().rss / 1e9
-                        avail_gb = psutil.virtual_memory().available / 1e9
-                        mem_info = f" [MEM] rss={rss_gb:.1f}GB avail={avail_gb:.1f}GB"
+                        cgroup_limit = int(open("/sys/fs/cgroup/memory.max").read().strip()) / 1e9
                     except Exception:
                         pass
-                    print(f"      Processed {processed}/{len(image_paths)} images{mem_info}", flush=True)
-
-            # TRUONG HOP stream tra ve it hon du kien (an toan)
-            for i in range(processed, len(indices)):
-                scores[indices[i]] = max_entropy
+                    mem_info = (f" [MEM] rss={rss_gb:.1f}GB"
+                                + (f"/limit={cgroup_limit:.1f}GB" if cgroup_limit else ""))
+                except Exception:
+                    pass
+                print(f"      Processed {processed}/{len(image_paths)} images{mem_info}", flush=True)
 
         return scores
 
@@ -477,7 +524,7 @@ class ActiveLearningLoop:
                     conf=0.001,
                     iou=0.7,
                     max_det=300,
-                    workers=self.predict_workers,
+                    workers=0,
                 )
             except Exception as e:
                 print(f"[WARNING] Chunk {start} failed: {e}")
@@ -495,6 +542,8 @@ class ActiveLearningLoop:
                     scores[idx] = calc_image_uncertainty(result, self.num_classes)
 
             del batch_results
+            if (start // chunk_size) % 4 == 0:
+                self._trim_memory()
             if (start // chunk_size) % 10 == 0:
                 gc.collect()
                 print(f"      Processed {min(start + chunk_size, len(image_paths))}/{len(image_paths)} images", flush=True)
