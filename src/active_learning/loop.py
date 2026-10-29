@@ -433,7 +433,7 @@ class ActiveLearningLoop:
                         scores[idx] = calc_image_uncertainty(result, self.num_classes)
                 processed += 1
 
-                if processed % 5000 == 0:
+                if processed % 1000 == 0:
                     mem_info = ""
                     try:
                         import psutil
