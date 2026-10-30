@@ -16,6 +16,10 @@ import shutil
 import warnings
 import numpy as np
 import torch  # Thêm cho memory management
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from sampling.uncertainty import calc_image_uncertainty
 from sampling.stratified import stratified_sampling, calculate_batch_diversity
@@ -30,6 +34,41 @@ from data.loader import (
     YOLO_CLASS_NAMES
 )
 from metrics.entropy import calc_batch_entropy
+
+
+# ---------------------------------------------------------------------------
+# Glibc heap tuning (QUAN TRỌNG cho Kaggle: OOM Killer đọc cgroup 32.2GB)
+# ---------------------------------------------------------------------------
+# glibc chỉ đọc biến môi trường MALLOC_* LÚC malloc init (trước main()).
+# Set os.environ["MALLOC_TRIM_THRESHOLD_"] trong cell đã chạy -> VÔ HIỆU.
+# Fix duy nhất hiệu lực ngay: mallopt(M_TRIM_THRESHOLD=-1, 65536) qua ctypes
+# -> glibc tự động trim heap về OS mỗi lần free, không cần gọi malloc_trim tay.
+_LIBC = None
+try:
+    import ctypes as _ctypes
+    _LIBC = _ctypes.CDLL("libc.so.6")
+    _LIBC.mallopt(-1, 65536)  # M_TRIM_THRESHOLD = -1 (glibc constant)
+    _LIBC.malloc_trim(0)
+    print("[MALLOC] mallopt(M_TRIM_THRESHOLD=65536) + malloc_trim(0) applied", flush=True)
+except Exception as _e:
+    _LIBC = None
+    print(f"[MALLOC] libc tuning unavailable: {_e}", flush=True)
+
+
+def _read_cgroup_memory():
+    """Đọc RAM đang dùng & giới hạn của cgroup (cái OOM Killer dùng)."""
+    cur = mx = None
+    for c, m in [("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+                  ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                   "/sys/fs/cgroup/memory/memory.limit_in_bytes")]:
+        try:
+            cur = int(open(c).read().strip()) / 1e9
+            raw = open(m).read().strip()
+            mx = int(raw) / 1e9 if raw.isdigit() else None
+            break
+        except Exception:
+            continue
+    return cur, mx
 
 
 class ActiveLearningLoop:
@@ -375,14 +414,14 @@ class ActiveLearningLoop:
         phóng -> RSS không về xuống -> cgroup đếm lố -> killed.
         malloc_trim(0) ép glibc trả lại toàn bộ.
         """
-        import ctypes
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        if _LIBC is not None:
+            try:
+                _LIBC.malloc_trim(0)
+            except Exception:
+                pass
 
     def _predict_uncertainty(
         self,
@@ -432,7 +471,10 @@ class ActiveLearningLoop:
         #   -> RSS thật sự hạ xuống, không phình dần cho đến khi OOM
         # - workers=0 (đọc ảnh ở main process, tránh CoW leak của multiprocessing)
         # - batch=128 giữ tốc độ GPU gần như không đổi (I/O-bound)
-        PREDICT_CHUNK = 4096
+        # CHUNK 1024 (giảm từ 4096): giảm đỉnh RAM giữa 2 lần trim -> an toàn
+        # hơn với cgroup 32.2GB khi heap phồng theo thời gian (I/O-bound nên
+        # tốc độ gần như không đổi).
+        PREDICT_CHUNK = 1024
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*half.*deprecated.*")
             processed = 0
@@ -480,17 +522,19 @@ class ActiveLearningLoop:
                 # ÉP RAM hoàn trả về OS cuỗi mỗi chunk (quan trọng nhất)
                 self._trim_memory()
 
+                # LOG MEM: RSS + cgroup usage/LIMIT (cái OOM Killer dùng)
+                # Log mỗi chunk -> nếu cgroup usage KHÔNG giảm giữa 2 log
+                # (trim không hiệu quả) hoặc tăng dần (leak), thấy ngay trong
+                # log thay vì chỉ biết khi "Kernel died".
                 mem_info = ""
                 try:
-                    import psutil
                     rss_gb = psutil.Process().memory_info().rss / 1e9
-                    cgroup_limit = None
-                    try:
-                        cgroup_limit = int(open("/sys/fs/cgroup/memory.max").read().strip()) / 1e9
-                    except Exception:
-                        pass
-                    mem_info = (f" [MEM] rss={rss_gb:.1f}GB"
-                                + (f"/limit={cgroup_limit:.1f}GB" if cgroup_limit else ""))
+                    cg_cur, cg_lim = _read_cgroup_memory()
+                    mem_info = f" [MEM] rss={rss_gb:.1f}GB"
+                    if cg_cur is not None:
+                        mem_info += f" cgroup={cg_cur:.1f}GB"
+                        if cg_lim is not None:
+                            mem_info += f"/limit={cg_lim:.1f}GB"
                 except Exception:
                     pass
                 print(f"      Processed {processed}/{len(image_paths)} images{mem_info}", flush=True)
