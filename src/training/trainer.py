@@ -283,7 +283,40 @@ class YOLOTrainer:
 
         results = self.model.train(**train_kwargs)
 
-        self.best_model_path = str(Path(self.project_dir) / save_name / "weights" / "best.pt")
+        # BUGFIX (10/2026): ultralytics ghi best.pt vào save_dir =
+        # <runs_dir>/experiments/runs/<exp>/round_N (vd /kaggle/working/runs/detect/...),
+        # KHÔNG PHẢI "experiments/runs/<exp>/round_N" (tương đối) như trước đây.
+        # best_model_path cũ trỏ vào file KHÔNG TỒN TẠI =>
+        #   - load_checkpoint() (resume) không warm-start được, phải train lại
+        #     từ pretrained => kết quả sau resume không tái lập.
+        # Cách sửa: dò nhiều ứng viên đường dẫn thực, lấy cái tồn tại đầu tiên.
+        best_pt_candidates = []
+        # 1) trainer.save_dir (nếu version ultralytics giữ lại)
+        trainer_obj = getattr(self.model, "trainer", None)
+        if trainer_obj is not None and getattr(trainer_obj, "save_dir", None):
+            best_pt_candidates.append(Path(trainer_obj.save_dir) / "weights" / "best.pt")
+        # 2) settings runs_dir (đúng cây mà log trên Kaggle trỏ tới)
+        try:
+            from ultralytics.utils import SETTINGS
+            runs_dir = Path(SETTINGS.get("runs_dir", "runs/detect")).expanduser()
+            best_pt_candidates.append(
+                runs_dir / self.project_dir / save_name / "weights" / "best.pt"
+            )
+        except Exception:
+            pass
+        # 3) fallback tương đối (chạy local không có runs_dir setting)
+        best_pt_candidates.append(
+            Path(self.project_dir) / save_name / "weights" / "best.pt"
+        )
+
+        found = next((c for c in best_pt_candidates if c.exists()), None)
+        self.best_model_path = str(found) if found else None
+        if found is None:
+            print(
+                f"[WARN] Không tìm thấy best.pt (đã thử: "
+                f"{[str(c) for c in best_pt_candidates]}) -> resume sẽ train lại "
+                f"từ pretrained."
+            )
 
         # Đánh giá trên FIXED eval set (nếu có) - đây là mAP dùng để báo cáo.
         # Val nội bộ (20% labeled) chỉ dùng cho early stopping / chọn weights.

@@ -645,22 +645,38 @@ class ActiveLearningLoop:
                 uncertainty_scores[idx] = 0.0
 
         # Chọn sampling method dựa trên config
+        # BUGFIX (10/2026): chỉ sampling trong POOL UNLABELED, không phải
+        # filtered_metadata toàn bộ. Phiên bản cũ truyền cả pool (gồm labeled
+        # + eval images) vào stratified_sampling: khi 1 stratum có ít hơn
+        # allocation ảnh unlabeled, code lấy TOÀN stratum (stratified.py
+        # L127) -> kéo theo cả index LABELED/eval vào batch -> eval set bị
+        # train (contamination) + duplicate labeled. Cách làm giống hệt
+        # initialize(): pool_metadata + map local index -> global index.
+        pool_indices = sorted(self.unlabeled_indices)
+        pool_metadata = [self.filtered_metadata[i] for i in pool_indices]
+        pool_scores = {
+            i: uncertainty_scores.get(pool_indices[i], 0.0)
+            for i in range(len(pool_indices))
+        }
+
         if self.use_baseline:
             print(f"[ROUND {round_num}] Running BASELINE sampling (uncertainty-only)...")
-            selected_indices = baseline_sampling(
-                uncertainty_scores = uncertainty_scores,
-                batch_size = min(self.batch_size, len(unlabeled_list)),
-                metadata_list = self.filtered_metadata,
+            selected_local = baseline_sampling(
+                uncertainty_scores = pool_scores,
+                batch_size = min(self.batch_size, len(pool_indices)),
+                metadata_list = pool_metadata,
                 stratify_fields = self.stratify_fields
             )
         else:
             print(f"[ROUND {round_num}] Running STRATIFIED sampling (metadata + uncertainty)...")
-            selected_indices = stratified_sampling(
-                metadata_list = self.filtered_metadata,
-                uncertainty_scores = uncertainty_scores,
-                batch_size = min(self.batch_size, len(unlabeled_list)),
+            selected_local = stratified_sampling(
+                metadata_list = pool_metadata,
+                uncertainty_scores = pool_scores,
+                batch_size = min(self.batch_size, len(pool_indices)),
                 stratify_fields= self.stratify_fields
             )
+        # Map local index trong pool -> global index trong filtered_metadata
+        selected_indices = [pool_indices[i] for i in selected_local]
 
         # tính diversity của batch đã chọn
         diversity = calculate_batch_diversity(
