@@ -16,28 +16,17 @@ from data.loader import YOLO_CLASS_NAMES, labels_to_yolo_lines
 
 
 class YOLOTrainer:
-    """
-    Trainer class cho YOLO model trong Active Learning loop.
-    """
+    """Trainer class cho YOLO model trong Active Learning loop."""
 
-    def __init__ (
+    def __init__(
         self,
         model_name: str = "yolov8n",
-        device = 0,
+        device=0,
         project_dir: str = "experiments/runs",
-        train_seed = None
+        train_seed=None,
+        retrain_from_scratch: bool = True,
+        warmup_epochs: float = 1.0,
     ):
-        """
-        Khởi tạo trainer.
-
-        Args:
-            model_name: Tên YOLO model (yolov8n, yolov8s, yolov8m, ...)
-            device: Thiết bị train ("cuda" hoặc "cpu")
-            project_dir: Thư mục lưu experiment results
-            train_seed: Seed cho ultralytics training. None = để ultralytics
-                tự dùng (mặc định 0 - tức mọi experiment giống nhau).
-        """
-
         self.model_name = model_name
         self.device = device
         self.project_dir = Path(project_dir)
@@ -45,34 +34,27 @@ class YOLOTrainer:
         self.best_model_path = None
         self.pretrained_path = f"{self.model_name}.pt"
         self.train_seed = train_seed
+        self.retrain_from_scratch = retrain_from_scratch
+        self.warmup_epochs = warmup_epochs
         self._last_eval_yaml = None
 
-        # Verify GPU availability
         if device != "cpu" and not self._check_cuda():
             raise RuntimeError(
-                f"CUDA device requested but not available. "
-                f"Either install CUDA drivers or set device='cpu' in config."
+                "CUDA device requested but not available. "
+                "Either install CUDA drivers or set device='cpu' in config."
             )
 
     def load_model(self, model_path: Optional[str] = None):
-        """
-        Load YOLO model.
-        
-        Args:
-            model_path: Đường dẫn checkpoint. Nếu None, load pretrained.
-        """
-
+        """Load YOLO model."""
         if model_path and Path(model_path).exists():
-            self.model = YOLO(model_path) 
+            self.model = YOLO(model_path)
         else:
-            # Load pretrained nhưng KHÔNG download lại nếu đã có
             if Path(self.pretrained_path).exists():
                 self.model = YOLO(self.pretrained_path)
             else:
                 self.model = YOLO(f"{self.model_name}.pt")
 
     def _check_cuda(self) -> bool:
-        """Kiểm tra CUDA có khả dụng không."""
         try:
             return torch.cuda.is_available() and torch.cuda.device_count() > 0
         except ImportError:
@@ -89,42 +71,19 @@ class YOLOTrainer:
         eval_metadata: List[Dict] = None,
         shared_eval_dir: str = None,
     ) -> str:
-        """
-        Chuẩn bị dataset từ metadata (labels nằm trong metadata, không phải file riêng).
-
-        Chia làm 3 phần:
-        - train: ảnh labeled dùng để train (trừ val nội bộ)
-        - val:   20% ảnh labeled, dùng cho early stopping / chọn best weights
-        - eval:  fixed held-out set (nếu có), dùng để BÁO CÁO mAP
-
-        Vì sao cần eval set cố định:
-        Nếu mAP đo trên val set rút ngẫu nhiên từ labeled pool mỗi round,
-        thì mAP ở các round khác nhau đo trên ảnh KHÁC NHAU -> không so sánh được,
-        và hơn nữa là rò rỉ (ảnh có thể nằm trong train của round sau).
-        Eval set cố định giữ mAP comparable giữa các round, các seed, các pipeline.
-
-        Args:
-            val_ratio: Tỉ lệ ảnh labeled dành cho validation nội bộ.
-            eval_paths: Đường dẫn ảnh eval set cố định (dùng làm `val` trong yaml).
-            eval_metadata: Metadata tương ứng với eval_paths.
-        """
-
         output_path = Path(output_dir)
         images_train = output_path / "images" / "train"
         images_val = output_path / "images" / "val"
         labels_train = output_path / "labels" / "train"
         labels_val = output_path / "labels" / "val"
 
+        # Xóa thư mục train/val cũ của round nếu chạy đè để tránh trộn ảnh rác
         for d in [images_train, images_val, labels_train, labels_val]:
+            if d.exists():
+                shutil.rmtree(d)
             d.mkdir(parents=True, exist_ok=True)
 
-        # Sort theo tên file trước khi split để val set ỔN ĐỊNH giữa các round.
-        # Nếu không sort, thứ tự image_paths thay đổi mỗi round (do set ordering)
-        # -> train_test_split chọn ảnh val khác mỗi vòng -> mAP không comparable.
-        paired = sorted(
-            zip(image_paths, metadata_list),
-            key=lambda p: str(p[0])
-        )
+        paired = sorted(zip(image_paths, metadata_list), key=lambda p: str(p[0]))
         sorted_paths = [p[0] for p in paired]
         sorted_metadata = [p[1] for p in paired]
 
@@ -156,16 +115,8 @@ class YOLOTrainer:
                 with open(label_file, "w") as f:
                     f.write("\n".join(yolo_lines))
 
-        # Ghi eval set (nếu có) thành dataset RIÊNG.
-        # QUAN TRỌNG: dataset.yaml vẫn trỏ `val` về val nội bộ (20% ảnh labeled)
-        # để early stopping / chọn best weights KHÔNG bị rò rỉ. Sau khi train xong
-        # sẽ gọi evaluate trên eval.yaml để lấy mAP báo cáo - mAP này đo trên tập
-        # CỐ ĐỊNH nên comparable giữa các round/seed/pipeline.
         eval_yaml_path = None
         if eval_paths and eval_metadata:
-            # Eval set được COPY 1 LẦN DUY NHẤT vào thư mục dùng chung,
-            # dùng lại cho mọi round và mọi experiment -> tiết kiệm ~3.6GB disk
-            # và rất nhiều thời gian I/O copy.
             eval_root = Path(shared_eval_dir or (output_path / "eval_set"))
             images_eval = eval_root / "images"
             labels_eval = eval_root / "labels"
@@ -184,7 +135,6 @@ class YOLOTrainer:
             if already_done:
                 print(f"[EVAL] Reuse eval set đã copy sẵn ({expected} ảnh) tại {eval_root}")
             else:
-                # Xóa nội dung cũ nếu có (tránh ảnh sót lại từ lần chạy trước)
                 for stale in images_eval.glob("*"):
                     if stale.is_file():
                         stale.unlink()
@@ -204,7 +154,6 @@ class YOLOTrainer:
                 manifest.write_text(str(expected))
                 print(f"[EVAL] Copied {expected} eval images to {eval_root}")
 
-            # Dataset riêng cho eval: train và val cùng trỏ về eval images
             eval_config = {
                 "path": str(eval_root.absolute()),
                 "train": "images",
@@ -227,75 +176,61 @@ class YOLOTrainer:
             yaml.dump(dataset_config, f)
 
         self._last_eval_yaml = eval_yaml_path
-
         return str(yaml_path)
-    
+
     def train(
         self,
         dataset_yaml: str,
-        epochs: int = 10,
+        epochs: int = 12,
         batch_size: int = 16,
         imgsz: int = 640,
         save_name: str = "train",
         patience: int = 0,
-        ) -> dict:
+    ) -> dict:
         """
         Train YOLO model.
-
-        Args:
-            patience: Early stopping patience (số epoch không cải thiện thì dừng).
-                0 = tắt early stopping (train đủ số epoch).
+        Khi retrain_from_scratch=True (mặc định chuẩn cho Active Learning), mỗi round
+        khởi tạo lại từ pretrained yolov8n.pt gốc và train trên toàn bộ tập labeled
+        tích lũy để tránh catastrophic forgetting và tránh overfit vào ảnh Round 0.
         """
-
-        if self.model is None:
-            if self.best_model_path and Path(self.best_model_path).exists():
-                self.load_model(self.best_model_path)
-            else:
-                self.load_model()
+        if self.retrain_from_scratch or self.model is None:
+            self.load_model(None)  # Luôn nạp lại yolov8n.pt gốc
+        elif self.best_model_path and Path(self.best_model_path).exists():
+            self.load_model(self.best_model_path)
+        else:
+            self.load_model(None)
 
         train_kwargs = dict(
-            data = dataset_yaml,
-            epochs = epochs,
-            batch = batch_size,
-            imgsz = imgsz,
-            device = self.device,
-            project = self.project_dir,
-            name = save_name,
-            exist_ok = True,
-            verbose = False,
-            # --- Tối ưu tốc độ (chất lượng gần như không đổi) ---
-            amp = True,           # mixed precision FP16: nhanh ~2x trên T4
-            workers = 8,          # dataloader workers
-            cache = False,         # không cache vào RAM (tiết kiệm RAM Kaggle)
-            plots = False,         # bỏ vẽ chart -> tiết kiệm thời gian + disk
-            val = True,
+            data=dataset_yaml,
+            epochs=epochs,
+            batch=batch_size,
+            imgsz=imgsz,
+            device=self.device,
+            project=self.project_dir,
+            name=save_name,
+            exist_ok=True,
+            verbose=False,
+            amp=True,
+            workers=8,
+            cache=False,
+            plots=False,
+            val=True,
+            warmup_epochs=self.warmup_epochs,  # Giảm warmup xuống 1.0 epoch
+            cos_lr=True,                       # Cosine LR scheduler giúp hội tụ mượt hơn
         )
 
-        # Seed cho ultralytics: nếu không set, ultralytics dùng seed=0 cho MỌI
-        # experiment -> 3 "seed" khác nhau chỉ khác ở bước AL selection, phần
-        # training giống hệt nhau. Set seed để mỗi replicate thực sự khác nhau.
         if self.train_seed is not None:
             train_kwargs["seed"] = self.train_seed
 
-        # Early stopping: patience > 0 thì ultralytics tự dừng khi mAP không tăng
         if patience and patience > 0:
             train_kwargs["patience"] = patience
 
         results = self.model.train(**train_kwargs)
 
-        # BUGFIX (10/2026): ultralytics ghi best.pt vào save_dir =
-        # <runs_dir>/experiments/runs/<exp>/round_N (vd /kaggle/working/runs/detect/...),
-        # KHÔNG PHẢI "experiments/runs/<exp>/round_N" (tương đối) như trước đây.
-        # best_model_path cũ trỏ vào file KHÔNG TỒN TẠI =>
-        #   - load_checkpoint() (resume) không warm-start được, phải train lại
-        #     từ pretrained => kết quả sau resume không tái lập.
-        # Cách sửa: dò nhiều ứng viên đường dẫn thực, lấy cái tồn tại đầu tiên.
         best_pt_candidates = []
-        # 1) trainer.save_dir (nếu version ultralytics giữ lại)
         trainer_obj = getattr(self.model, "trainer", None)
         if trainer_obj is not None and getattr(trainer_obj, "save_dir", None):
             best_pt_candidates.append(Path(trainer_obj.save_dir) / "weights" / "best.pt")
-        # 2) settings runs_dir (đúng cây mà log trên Kaggle trỏ tới)
         try:
             from ultralytics.utils import SETTINGS
             runs_dir = Path(SETTINGS.get("runs_dir", "runs/detect")).expanduser()
@@ -304,27 +239,21 @@ class YOLOTrainer:
             )
         except Exception:
             pass
-        # 3) fallback tương đối (chạy local không có runs_dir setting)
-        best_pt_candidates.append(
-            Path(self.project_dir) / save_name / "weights" / "best.pt"
-        )
+        best_pt_candidates.append(Path(self.project_dir) / save_name / "weights" / "best.pt")
 
         found = next((c for c in best_pt_candidates if c.exists()), None)
         self.best_model_path = str(found) if found else None
-        if found is None:
-            print(
-                f"[WARN] Không tìm thấy best.pt (đã thử: "
-                f"{[str(c) for c in best_pt_candidates]}) -> resume sẽ train lại "
-                f"từ pretrained."
-            )
 
-        # Đánh giá trên FIXED eval set (nếu có) - đây là mAP dùng để báo cáo.
-        # Val nội bộ (20% labeled) chỉ dùng cho early stopping / chọn weights.
+        # Load lại đúng best.pt vừa tìm được vào self.model để bước predict round sau chuẩn xác
+        if self.best_model_path:
+            self.load_model(self.best_model_path)
+
+        # Đánh giá trên FIXED eval set (2000 ảnh)
         eval_metrics = {}
         eval_yaml = getattr(self, "_last_eval_yaml", None)
         if eval_yaml and Path(eval_yaml).exists():
             try:
-                eval_metrics = self.evaluate(eval_yaml)
+                eval_metrics = self.evaluate(eval_yaml, weights=self.best_model_path)
                 print(f"[EVAL] Fixed eval set mAP50={eval_metrics['map50']:.4f} "
                       f"mAP50-95={eval_metrics['map50_95']:.4f}")
             except Exception as e:
@@ -332,27 +261,21 @@ class YOLOTrainer:
 
         return {
             "best_model_path": self.best_model_path,
-            "map50": results.results_dict.get("metrics/mAP50(B)", 0.0),
-            "map50_95": results.results_dict.get("metrics/mAP50-95(B)", 0.0),
+            "map50": float(results.results_dict.get("metrics/mAP50(B)", 0.0)),
+            "map50_95": float(results.results_dict.get("metrics/mAP50-95(B)", 0.0)),
             "epochs_run": getattr(results, "epochs", epochs),
-            # Metric chính để so sánh giữa các round/seed/pipeline
-            "eval_map50": eval_metrics.get("map50", 0.0),
-            "eval_map50_95": eval_metrics.get("map50_95", 0.0),
-            "eval_map75": eval_metrics.get("map75", 0.0),
-            "eval_precision": eval_metrics.get("precision", 0.0),
-            "eval_recall": eval_metrics.get("recall", 0.0),
+            "eval_map50": float(eval_metrics.get("map50", 0.0)),
+            "eval_map50_95": float(eval_metrics.get("map50_95", 0.0)),
+            "eval_map75": float(eval_metrics.get("map75", 0.0)),
+            "eval_precision": float(eval_metrics.get("precision", 0.0)),
+            "eval_recall": float(eval_metrics.get("recall", 0.0)),
+            "per_class_ap50": eval_metrics.get("per_class_ap50", {}),
+            "per_class_ap50_95": eval_metrics.get("per_class_ap50_95", {}),
         }
 
     def evaluate(self, dataset_yaml: str, weights: str = None) -> dict:
-        """Evaluate model trên một dataset yaml.
-
-        Args:
-            dataset_yaml: Đường dẫn dataset yaml
-            weights: Đường dẫn weights cụ thể (mặc định dùng model hiện tại).
-                Dùng best.pt để đánh giá đúng model được chọn.
-        """
-        if weights:
-            from ultralytics import YOLO
+        """Evaluate model trên dataset yaml và trích xuất luôn Per-class AP cho RQ2."""
+        if weights and Path(weights).exists():
             eval_model = YOLO(weights)
         else:
             if self.model is None:
@@ -360,67 +283,48 @@ class YOLOTrainer:
             eval_model = self.model
 
         metrics = eval_model.val(
-            data = dataset_yaml,
-            device = self.device,
-            verbose = False,
-            plots = False,
+            data=dataset_yaml,
+            device=self.device,
+            verbose=False,
+            plots=False,
         )
 
+        # Trích xuất Per-class AP50 và AP50-95 để trả lời Câu hỏi phụ RQ2 trong Proposal
+        per_class_ap50 = {}
+        per_class_ap50_95 = {}
+        try:
+            ap50_arr = getattr(metrics.box, "ap50", None)
+            maps_arr = getattr(metrics.box, "maps", None)
+            ap_class_index = getattr(metrics.box, "ap_class_index", None)
+
+            if isinstance(YOLO_CLASS_NAMES, dict):
+                class_names = [YOLO_CLASS_NAMES[k] for k in sorted(YOLO_CLASS_NAMES.keys())]
+            else:
+                class_names = list(YOLO_CLASS_NAMES)
+
+            if ap50_arr is not None and ap_class_index is not None:
+                for idx_pos, cls_id in enumerate(ap_class_index):
+                    cname = class_names[int(cls_id)] if int(cls_id) < len(class_names) else f"class_{cls_id}"
+                    per_class_ap50[cname] = round(float(ap50_arr[idx_pos]), 4)
+
+            if maps_arr is not None:
+                for cls_id, val in enumerate(maps_arr):
+                    cname = class_names[cls_id] if cls_id < len(class_names) else f"class_{cls_id}"
+                    per_class_ap50_95[cname] = round(float(val), 4)
+        except Exception as e:
+            print(f"[WARN] Không trích xuất được per-class AP: {e}")
+
         return {
-            "map50": metrics.box.map50,
-            "map75": metrics.box.map75,
-            "map50_95": metrics.box.map,
-            "precision": metrics.box.mp,
-            "recall": metrics.box.mr
+            "map50": float(metrics.box.map50),
+            "map75": float(metrics.box.map75),
+            "map50_95": float(metrics.box.map),
+            "precision": float(metrics.box.mp),
+            "recall": float(metrics.box.mr),
+            "per_class_ap50": per_class_ap50,
+            "per_class_ap50_95": per_class_ap50_95,
         }
 
     def predict(self, image_path: str, **kwargs):
-        """Predict trên một ảnh."""
         if self.model is None:
             raise ValueError("Model chưa được load.")
         return self.model.predict(source=image_path, **kwargs)
-
-    def predict_batch(self, image_paths: List[str], batch_size: int = 8, show_progress: bool = True) -> List:
-        """
-        Predict trên nhiều ảnh cùng lúc với batch size nhỏ.
-        
-        Args:
-            image_paths: Danh sách đường dẫn ảnh
-            batch_size: Số ảnh xử lý mỗi batch (NHỎ để tránh OOM)
-            show_progress: Hiển thị progress bar
-        
-        Returns:
-            List các YOLO Results objects
-        """
-        if self.model is None:
-            raise ValueError("Model chưa được load.")
-        
-        results = []
-        total = len(image_paths)
-        
-        for i in range(0, total, batch_size):
-            batch = image_paths[i:i + batch_size]
-            
-            # Batch predict với batch_size NHỎ
-            batch_results = self.model.predict(
-                source=batch,
-                batch=batch_size,
-                verbose=False
-            )
-            
-            # Nếu batch chỉ có 1 ảnh, ultralytics trả về 1 object thay vì list
-            if isinstance(batch_results, list):
-                results.extend(batch_results)
-            else:
-                results.append(batch_results)
-            
-            # Dọn memory SAU MỖI BATCH
-            if i % 500 == 0 and i > 0:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            if show_progress and (i + batch_size) % 2000 == 0:
-                print(f"      Predicted {min(i + batch_size, total)}/{total} images")
-        
-        return results
