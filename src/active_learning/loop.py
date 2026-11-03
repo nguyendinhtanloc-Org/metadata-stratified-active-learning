@@ -92,6 +92,12 @@ class ActiveLearningLoop:
         self.predict_imgsz = config.get("predict_imgsz", 640)
         # Giải pháp A: Candidate sub-pool (None hoặc <=0 sẽ quét toàn bộ 59k ảnh)
         self.candidate_pool_size = config.get("candidate_pool_size", 15000)
+        # Hybrid Top-K filtering cho stratified sampling:
+        #   0  = phân tầng trên toàn bộ candidate pool (hành vi cũ)
+        #   >0 = lọc Top-(batch_size * ratio) ảnh khó nhất TRƯỚC, rồi mới
+        #        phân tầng bên trong tập ảnh khó (xem sampling/stratified.py)
+        # Dùng để ablation: bật/tắt bằng 1 dòng config.
+        self.hybrid_top_k_ratio = config.get("hybrid_top_k_ratio", 0)
 
         self.local_image_cache = config.get("local_image_cache", None)
         self.eval_size = config.get("eval_size", 2000)
@@ -413,12 +419,14 @@ class ActiveLearningLoop:
                 stratify_fields=self.stratify_fields
             )
         else:
-            print(f"[ROUND {round_num}] Running STRATIFIED sampling (metadata + uncertainty)...")
+            print(f"[ROUND {round_num}] Running STRATIFIED sampling (metadata + uncertainty)"
+                  + (f" [HYBRID top-{self.hybrid_top_k_ratio}x]" if self.hybrid_top_k_ratio else ""))
             selected_local = stratified_sampling(
                 metadata_list=pool_metadata,
                 uncertainty_scores=pool_scores,
                 batch_size=min(self.batch_size, len(pool_indices)),
-                stratify_fields=self.stratify_fields
+                stratify_fields=self.stratify_fields,
+                hybrid_top_k_ratio=self.hybrid_top_k_ratio
             )
 
         selected_indices = [pool_indices[i] for i in selected_local]
@@ -463,6 +471,9 @@ class ActiveLearningLoop:
                 "use_baseline": self.use_baseline,
                 "num_rounds": self.num_rounds,
                 "epochs": self.epochs,
+                "hybrid_top_k_ratio": self.hybrid_top_k_ratio,
+                "candidate_pool_size": self.candidate_pool_size,
+                "retrain_from_scratch": self.retrain_from_scratch,
             },
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -480,6 +491,11 @@ class ActiveLearningLoop:
         self.filtered_metadata = checkpoint.get("filtered_metadata", [])
         self.all_metadata = checkpoint["all_metadata"]
         self.eval_indices = checkpoint.get("eval_indices", [])
+        # Giữ đúng protocol khi resume (tránh lệch giữa các phiên chạy)
+        ck_cfg = checkpoint.get("config", {})
+        for key in ("hybrid_top_k_ratio", "candidate_pool_size", "retrain_from_scratch"):
+            if key in ck_cfg:
+                setattr(self, key, ck_cfg[key])
 
         best_model_path = checkpoint.get("best_model_path")
         if best_model_path and Path(best_model_path).exists():
@@ -516,6 +532,26 @@ class ActiveLearningLoop:
 
         checkpoint_path = str(output_path / "checkpoint.pkl")
         results_csv_path = str(output_path / "results.csv")
+
+        # BƯỚC 2 (domain-specific evaluation): dump metadata của eval set
+        # CỐ ĐỊNH (2000 ảnh, seed 2024) ra CSV -> notebook join với
+        # predictions.csv của ultralytics theo 'filename' để tính mAP
+        # riêng theo domain (night / adverse weather / rare scene).
+        # Idempotent: mọi experiment đều ghi cùng nội dung (cùng eval set).
+        if self.eval_indices:
+            import pandas as pd
+            em = [self.filtered_metadata[i] for i in self.eval_indices]
+            pd.DataFrame([
+                {
+                    "filename": m.get("filename"),
+                    "image_path": m.get("image_path"),
+                    "weather": m.get("weather", "unknown"),
+                    "scene": m.get("scene", "unknown"),
+                    "timeofday": m.get("timeofday", "unknown"),
+                }
+                for m in em
+            ]).to_csv(str(Path(output_dir) / "_shared_eval_metadata.csv"), index=False)
+            print(f"[EVAL-META] {len(em)} rows -> {Path(output_dir) / '_shared_eval_metadata.csv'}")
 
         print(f"\n==================================================")
         print(f"Starting Active Learning Loop")
