@@ -73,12 +73,45 @@ def sample_proportional_to_stratum_size(
 
 
 def stratified_sampling(
-    metadata_list: List[Dict], 
+    metadata_list: List[Dict],
     uncertainty_scores: Dict[int, float],
     batch_size: int,
-    stratify_fields: List[str] = ["weather", "scene", "timeofday"]
+    stratify_fields: List[str] = ["weather", "scene", "timeofday"],
+    hybrid_top_k_ratio: int = 0,
 ) -> List[int]:
-    """Chọn batch đa dạng về metadata, ưu tiên uncertainty cao."""
+    """Chọn batch đa dạng về metadata, ưu tiên uncertainty cao.
+
+    hybrid_top_k_ratio > 0 bật chế độ HYBRID (Top-K filtering):
+      1. Lọc Top-K ảnh khó nhất (uncertainty cao nhất) trên toàn bộ candidate pool,
+         K = batch_size * hybrid_top_k_ratio.
+      2. CHỈ trong Top-K đó mới phân tầng metadata + phân bổ quota.
+      3. Trong mỗi tầng, lấy top theo uncertainty.
+
+    Lý do (failure mode của bản cũ): bản cũ phân tầng trên TOÀN BỘ pool rồi
+    mới lấy top-k uncertainty trong từng tầng. Tầng "dễ" (model tự tin) bị ép
+    lấy ảnh uncertainty thấp chỉ vì tầng đó đông -> batch gồm nhiều ảnh dễ,
+    lãng phí ngân sách annotation. Hybrid lấy quota theo phân phối *bên trong
+    tập ảnh khó*, nên mọi ảnh được chọn đều khó.
+
+    hybrid_top_k_ratio = 0 -> hành vi cũ (giữ để ablation).
+    """
+    if hybrid_top_k_ratio and hybrid_top_k_ratio > 0:
+        k = min(len(metadata_list), batch_size * hybrid_top_k_ratio)
+        top_k = sorted(
+            range(len(metadata_list)),
+            key=lambda i: uncertainty_scores.get(i, 0.0),
+            reverse=True
+        )[:k]
+        # Đánh lại index 0..k-1 để hàm phân tầng dùng lại được
+        remap = {old: new for new, old in enumerate(top_k)}
+        sub_metadata = [metadata_list[old] for old in top_k]
+        sub_scores = {remap[old]: uncertainty_scores.get(old, 0.0) for old in top_k}
+        selected = stratified_sampling(
+            sub_metadata, sub_scores, batch_size, stratify_fields,
+            hybrid_top_k_ratio=0,
+        )
+        return [top_k[i] for i in selected]
+
     strata = stratify_by_metadata(metadata_list, stratify_fields)
     allocation = sample_proportional_to_stratum_size(strata, batch_size)
 
