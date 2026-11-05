@@ -19,12 +19,12 @@ class TestActiveLearningLoop:
         config = {
             "seed": 42,
             "initial_budget": 10,
-            "batch_size": 5,
+            "al_batch_size": 5,
             "num_rounds": 3,
             "num_classes": 10,
             "stratify_fields": ["weather", "scene", "timeofday"],
             "model_name": "yolov8n",
-            "device": "cuda"
+            "device": "cpu"
         }
 
         loop = ActiveLearningLoop(config, experiment_name="test")
@@ -37,28 +37,29 @@ class TestActiveLearningLoop:
     def test_initialization_with_default(self):
         """Test khởi tạo với default values."""
 
-        config = {}
+        # device="cpu": môi trường test không có GPU (default là 0/GPU).
+        config = {"device": "cpu"}
 
         loop = ActiveLearningLoop(config)
 
         assert loop.seed == 42
-        assert loop.initial_budget == 1000
+        assert loop.initial_budget == 500
         assert loop.batch_size == 500
 
-    def test_checkout_point_save_load(self):
+    def test_checkout_point_save_load(self, tmp_path):
         """Test save và load checkpoint."""
 
-        config = {"seed": 42, "initial_budget": 10}
+        config = {"seed": 42, "initial_budget": 10, "device": "cpu"}
 
         loop = ActiveLearningLoop(config, experiment_name="test_checkpoint")
 
         # mock state
         loop.labeled_indices = {1, 2, 3}
         loop.unlabeled_indices = {4, 5, 6, 7, 8, 9, 10}
-        loop.history = [{"round": 0, "map50": 0.5}]
+        loop.results_history = [{"round": 0, "map50": 0.5}]
 
-        # save checkpoint
-        checkpoint_path = "test_checkpoint.pkl"
+        # save checkpoint (tmp_path: không ghi vào repo)
+        checkpoint_path = str(tmp_path / "test_checkpoint.pkl")
         loop.save_checkpoint(checkpoint_path)
 
         # tạo loop mới và load
@@ -67,16 +68,28 @@ class TestActiveLearningLoop:
 
         assert loop2.labeled_indices == {1, 2, 3}
         assert loop2.unlabeled_indices == {4, 5, 6, 7, 8, 9, 10}
-        assert len(loop2.history) == 1
+        assert len(loop2.results_history) == 1
 
-        # clean up
-        Path(checkpoint_path).unlink(missing_ok=True)
+    def test_quota_config_defaults(self):
+        """Quota mặc định = hành vi cũ (proportional/joint)."""
+        loop = ActiveLearningLoop({"device": "cpu"}, experiment_name="test_quota")
+        assert loop.quota_mode == "proportional"
+        assert loop.quota_scope == "joint"
+
+    def test_quota_config_overrides(self):
+        """Config quota_mode/quota_scope được nạp đúng."""
+        loop = ActiveLearningLoop(
+            {"device": "cpu", "quota_mode": "inverse", "quota_scope": "per_field"},
+            experiment_name="test_quota2",
+        )
+        assert loop.quota_mode == "inverse"
+        assert loop.quota_scope == "per_field"
 
     def test_seed_reproducibility(self):
         """Test seed tạo ra kết quả giống nhau."""
 
-        config1 = {"seed": 123, "initial_budget": 5}
-        config2 = {"seed": 123, "initial_budget": 5}
+        config1 = {"seed": 123, "initial_budget": 5, "device": "cpu"}
+        config2 = {"seed": 123, "initial_budget": 5, "device": "cpu"}
 
         loop1 = ActiveLearningLoop(config1, experiment_name="test1")
         loop2 = ActiveLearningLoop(config2, experiment_name="test2")
