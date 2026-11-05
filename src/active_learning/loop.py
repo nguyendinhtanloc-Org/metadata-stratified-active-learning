@@ -98,6 +98,14 @@ class ActiveLearningLoop:
         #        phân tầng bên trong tập ảnh khó (xem sampling/stratified.py)
         # Dùng để ablation: bật/tắt bằng 1 dòng config.
         self.hybrid_top_k_ratio = config.get("hybrid_top_k_ratio", 0)
+        # P1: quota mode cho stratified sampling.
+        #   "proportional" (cũ): quota ∝ size stratum -> giữ nguyên phân phối gốc.
+        #   "inverse": quota ∝ 1/size -> ưu tiên stratum hiếm (mục tiêu coverage).
+        #   "equal": quota chia đều.
+        self.quota_mode = config.get("quota_mode", "proportional")
+        # quota_scope: "joint" (1 tầng = tổ hợp field) | "per_field"
+        # (quota riêng cho từng field -> cân bằng diversity đo theo field).
+        self.quota_scope = config.get("quota_scope", "joint")
 
         self.local_image_cache = config.get("local_image_cache", None)
         self.eval_size = config.get("eval_size", 2000)
@@ -420,13 +428,16 @@ class ActiveLearningLoop:
             )
         else:
             print(f"[ROUND {round_num}] Running STRATIFIED sampling (metadata + uncertainty)"
-                  + (f" [HYBRID top-{self.hybrid_top_k_ratio}x]" if self.hybrid_top_k_ratio else ""))
+                  + (f" [HYBRID top-{self.hybrid_top_k_ratio}x]" if self.hybrid_top_k_ratio else "")
+                  + f" [quota={self.quota_mode}/{self.quota_scope}]")
             selected_local = stratified_sampling(
                 metadata_list=pool_metadata,
                 uncertainty_scores=pool_scores,
                 batch_size=min(self.batch_size, len(pool_indices)),
                 stratify_fields=self.stratify_fields,
-                hybrid_top_k_ratio=self.hybrid_top_k_ratio
+                hybrid_top_k_ratio=self.hybrid_top_k_ratio,
+                quota_mode=self.quota_mode,
+                quota_scope=self.quota_scope
             )
 
         selected_indices = [pool_indices[i] for i in selected_local]
@@ -472,6 +483,8 @@ class ActiveLearningLoop:
                 "num_rounds": self.num_rounds,
                 "epochs": self.epochs,
                 "hybrid_top_k_ratio": self.hybrid_top_k_ratio,
+                "quota_mode": self.quota_mode,
+                "quota_scope": self.quota_scope,
                 "candidate_pool_size": self.candidate_pool_size,
                 "retrain_from_scratch": self.retrain_from_scratch,
             },
@@ -493,7 +506,8 @@ class ActiveLearningLoop:
         self.eval_indices = checkpoint.get("eval_indices", [])
         # Giữ đúng protocol khi resume (tránh lệch giữa các phiên chạy)
         ck_cfg = checkpoint.get("config", {})
-        for key in ("hybrid_top_k_ratio", "candidate_pool_size", "retrain_from_scratch"):
+        for key in ("hybrid_top_k_ratio", "candidate_pool_size", "retrain_from_scratch",
+                    "quota_mode", "quota_scope"):
             if key in ck_cfg:
                 setattr(self, key, ck_cfg[key])
 
