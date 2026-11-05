@@ -160,3 +160,166 @@ class TestCalculationDiversity:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+class TestAllocateQuotaModes:
+    """Test các mode quota mới (P1) - inverse/equal thay cho proportional."""
+
+    def test_inverse_favours_rare_strata(self):
+        """Quota inverse phải cho tầng hiếm NHIỀU hơn so với proportional."""
+        from sampling.stratified import allocate_quota
+
+        strata = {
+            ("common",): list(range(90)),   # tầng đông
+            ("rare",): list(range(90, 100)),  # tầng hiếm (chỉ 10 ảnh)
+        }
+        inv = allocate_quota(strata, 50, mode="inverse")
+        prop = allocate_quota(strata, 50, mode="proportional")
+
+        assert sum(inv.values()) == 50
+        # Tầng hiếm bị bão hòa (lấy hết 10) thay vì bị bỏ qua như proportional.
+        assert inv[("rare",)] == 10
+        assert prop[("rare",)] < 10
+        assert inv[("rare",)] > prop[("rare",)]
+
+    def test_inverse_never_below_proportional_for_rare(self):
+        """Với tầng hiếm có capacity, inverse luôn >= proportional."""
+        from sampling.stratified import allocate_quota
+
+        strata = {
+            ("a",): list(range(100)),
+            ("rare",): list(range(100, 120)),  # 20 ảnh
+        }
+        inv = allocate_quota(strata, 40, mode="inverse")
+        prop = allocate_quota(strata, 40, mode="proportional")
+        assert inv[("rare",)] >= prop[("rare",)]
+        assert inv[("rare",)] > prop[("rare",)]
+
+    def test_equal_splits_evenly(self):
+        """Quota equal chia đều giữa các tầng (khi đủ sức chứa)."""
+        from sampling.stratified import allocate_quota
+
+        strata = {
+            ("a",): list(range(40)),
+            ("b",): list(range(40, 80)),
+            ("c",): list(range(80, 120)),
+        }
+        alloc = allocate_quota(strata, 30, mode="equal")
+
+        assert sum(alloc.values()) == 30
+        assert alloc[("a",)] == alloc[("b",)] == alloc[("c",)] == 10
+
+    def test_quota_never_exceeds_stratum_size(self):
+        """Mọi mode: quota <= size stratum."""
+        from sampling.stratified import allocate_quota
+
+        strata = {
+            ("tiny",): [0, 1],
+            ("big",): list(range(2, 100)),
+        }
+        for mode in ("proportional", "equal", "inverse"):
+            alloc = allocate_quota(strata, 50, mode=mode)
+            assert alloc[("tiny",)] <= 2, mode
+            assert sum(alloc.values()) == 50, mode
+
+    def test_invalid_mode_raises(self):
+        """Mode lạ phải raise ValueError (không silent fallback)."""
+        from sampling.stratified import allocate_quota
+
+        strata = {("a",): [0, 1, 2]}
+        with pytest.raises(ValueError):
+            allocate_quota(strata, 2, mode="bogus")
+
+    def test_total_never_exceeds_pool_size(self):
+        """Nếu total_samples > pool size thì lấy hết, không âm."""
+        from sampling.stratified import allocate_quota
+
+        strata = {("a",): [0, 1], ("b",): [2]}
+        alloc = allocate_quota(strata, 100, mode="inverse")
+        assert sum(alloc.values()) == 3
+
+
+class TestPerFieldQuota:
+    """Test quota_scope='per_field' (P1): quota riêng cho từng field."""
+
+    def _make_metadata(self):
+        # 1 scene phổ biến (street) x 8, 1 scene hiếm (tunnel) x 2
+        meta = []
+        for _ in range(8):
+            meta.append({"weather": "clear", "scene": "street", "timeofday": "daytime"})
+        for _ in range(2):
+            meta.append({"weather": "rainy", "scene": "tunnel", "timeofday": "night"})
+        return meta
+
+    def test_per_field_balances_scene(self):
+        """per_field + inverse: scene hiếm phải được ưu tiên hơn scene đông."""
+        from sampling.stratified import stratified_sampling
+
+        meta = self._make_metadata()
+        scores = {i: 1.0 - i * 0.01 for i in range(len(meta))}  # idx 0..7 là street
+        selected = stratified_sampling(
+            meta, scores, batch_size=4,
+            stratify_fields=["weather", "scene", "timeofday"],
+            quota_mode="inverse", quota_scope="per_field",
+        )
+        scenes = [meta[i]["scene"] for i in selected]
+        assert len(selected) == 4
+        assert scenes.count("tunnel") >= 1, scenes
+
+    def test_per_field_rejects_proportional(self):
+        """per_field + proportional là vô nghĩa -> phải raise."""
+        from sampling.stratified import stratified_sampling
+
+        meta = self._make_metadata()
+        with pytest.raises(ValueError):
+            stratified_sampling(
+                meta, {i: 0.5 for i in range(len(meta))}, batch_size=2,
+                quota_mode="proportional", quota_scope="per_field",
+            )
+
+    def test_per_field_respects_batch_size(self):
+        """Batch size luôn được tôn trọng."""
+        from sampling.stratified import stratified_sampling
+
+        meta = self._make_metadata()
+        scores = {i: 0.9 - i * 0.05 for i in range(len(meta))}
+        selected = stratified_sampling(
+            meta, scores, batch_size=3,
+            quota_mode="inverse", quota_scope="per_field",
+        )
+        assert len(selected) == 3
+        assert len(set(selected)) == 3
+
+    def test_joint_scope_still_works(self):
+        """quota_scope='joint' (default) không đổi hành vi cũ."""
+        from sampling.stratified import stratified_sampling
+
+        meta = self._make_metadata()
+        scores = {i: 0.5 for i in range(len(meta))}
+        selected = stratified_sampling(
+            meta, scores, batch_size=4, quota_scope="joint",
+        )
+        assert len(selected) == 4
+
+
+class TestQuotaDiversityGain:
+    """Kiểm chứng mục tiêu của P1: quota inverse làm TĂNG entropy theo field."""
+
+    def test_inverse_improves_scene_entropy_vs_proportional(self):
+        """Trên pool lệch mạnh, inverse phải cho entropy scene CAO HƠN proportional."""
+        from sampling.stratified import stratified_sampling
+        from metrics.entropy import calc_batch_entropy
+
+        # pool: 90 street + 10 tunnel, batch 20
+        meta = ([{"weather": "clear", "scene": "street", "timeofday": "daytime"}] * 90
+                + [{"weather": "rainy", "scene": "tunnel", "timeofday": "night"}] * 10)
+        # uncertainty ngẫu nhiên giả định -> dùng điểm tổng hợp 0.5 cho tất cả
+        scores = {i: 0.5 for i in range(len(meta))}
+
+        sel_prop = stratified_sampling(
+            meta, scores, batch_size=20, quota_mode="proportional")
+        sel_inv = stratified_sampling(
+            meta, scores, batch_size=20, quota_mode="inverse")
+
+        ent_prop = calc_batch_entropy([meta[i] for i in sel_prop], "scene")
+        ent_inv = calc_batch_entropy([meta[i] for i in sel_inv], "scene")
+        assert ent_inv > ent_prop, f"inverse {ent_inv} <= proportional {ent_prop}"
