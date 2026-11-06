@@ -285,44 +285,112 @@ def select_balanced_batch(
     batch_size: int,
     stratify_fields: List[str],
     quotas: Dict[str, Dict[Any, int]],
+    ipf_iterations: int = 60,
+    uncertainty_weight: float = 0.3,
 ) -> List[int]:
     """
     Chọn batch thỏa mãn đồng thời quota của từng field, ưu tiên uncertainty cao.
 
-    Tham lam (greedy): duyệt candidate theo uncertainty giảm dần, nhận ảnh nếu
-    mọi field của ảnh đó chưa đạt quota. Ảnh bị bỏ (vì đã đủ quota ở ít nhất
-    một field) được giữ lại làm "dự phòng" cho các field còn thiếu.
+    Thuật toán: IPF (Iterative Proportional Fitting) / Sinkhorn trên các
+    CELL (tổ hợp giá trị của stratify_fields).
 
-    Sau vòng lượt chính, nếu batch chưa đủ (vì pool không đủ ảnh thỏa quota),
-    lấp thêm theo uncertainty từ các ảnh còn lại.
+    Vì sao KHÔNG dùng greedy AND-gate (bản cũ):
+      Bản cũ duyệt theo uncertainty giảm dần, chỉ nhận ảnh khi MỌI field còn
+      quota. Với nhiều field (weather x scene x timeofday), "nút cổ chai" xảy
+      ra sớm: chỉ ~227/500 ảnh được chọn theo quota, 273 ảnh còn lại fill từ
+      pool (mua uncertainty) -> quota bị phá, entropy field không cải thiện.
+
+    Cách làm (IPF):
+      1. Gom pool thành cells theo (weather, scene, timeofday).
+      2. Weight mỗi cell, lặp ipf_iterations lần: cho mỗi field, điều chỉnh
+         weight cell để marginal theo field tiến tới quota (Sinkhorn-style
+         normalization).
+      3. Sắp xếp cell theo weight giảm, lấy ảnh từ cell cao nhất trước
+         (trần theo min quota của cell), ưu tiên uncertainty cao trong cell.
+      4. Nếu thiếu, fill theo uncertainty (giữ batch_size đúng).
     """
     if not quotas:
         return []
 
-    remaining = {f: dict(q) for f, q in quotas.items()}
-    order = sorted(
-        range(len(metadata_list)),
-        key=lambda i: uncertainty_scores.get(i, 0.0),
-        reverse=True,
-    )
+    # 1) Gom cells
+    cells = defaultdict(list)
+    for i, meta in enumerate(metadata_list):
+        key = tuple(meta.get(f, "unknown") for f in stratify_fields)
+        cells[key].append(i)
+    cell_keys = list(cells.keys())
 
+    # 2) Weight ban đầu = mix (uncertainty cao trong cell), rồi IPF
+    weights = {
+        c: (1.0 - uncertainty_weight)
+            + uncertainty_weight * max(
+                (uncertainty_scores.get(i, 0.0) for i in cells[c]), default=0.0
+            )
+        for c in cell_keys
+    }
+    for _ in range(ipf_iterations):
+        for fi, field in enumerate(stratify_fields):
+            field_quota = quotas.get(field, {})
+            marginal = defaultdict(float)
+            for c in cell_keys:
+                marginal[c[fi]] += weights[c]
+            for c in cell_keys:
+                value = c[fi]
+                target = field_quota.get(value, 0)
+                # Cell có field value NHIỀU hơn quota -> weight -> 0
+                if target == 0:
+                    weights[c] = 0.0
+                else:
+                    # Tỉ lệ (target * n) / marginal hiện tại:
+                    #   tăng weight cell nếu marginal thấp hơn quota (hiếm),
+                    #   giảm nếu cao hơn. n = batch_size (đơn vị: 1 quota = 1 ảnh).
+                    denom = marginal[value]
+                    if denom > 0:
+                        weights[c] *= (target * batch_size) / denom
+            # Normalization: giữ tổng weight = batch_size để tránh overflow/underflow
+            total = sum(weights.values())
+            if total > 0:
+                scale = batch_size / total
+                for c in cell_keys:
+                    weights[c] *= scale
+        # Chống underflow: nếu có cell "sống" thì quy về, không thì dừng
+        alive = sum(1 for c in cell_keys if weights[c] > 0)
+        if alive == 0:
+            break
+
+    # 3) Lấy ảnh theo cell weight giảm, cap theo min quota của cell
+    def cell_cap(c):
+        cap = batch_size
+        for fi, field in enumerate(stratify_fields):
+            cap = min(cap, quotas.get(field, {}).get(c[fi], 0))
+        return cap
+
+    ordered_cells = sorted(cell_keys, key=lambda c: weights[c], reverse=True)
     selected = []
-    leftover = []
-    for idx in order:
+    for c in ordered_cells:
         if len(selected) >= batch_size:
-            leftover.append(idx)
+            break
+        lim = min(cell_cap(c), batch_size - len(selected))
+        if lim <= 0:
             continue
-        vals = {f: metadata_list[idx].get(f, "unknown") for f in stratify_fields}
-        if all(remaining[f].get(vals[f], 0) > 0 for f in stratify_fields):
-            selected.append(idx)
-            for f in stratify_fields:
-                remaining[f][vals[f]] -= 1
-        else:
-            leftover.append(idx)
+        # Trong cell: ưu tiên uncertainty cao
+        picked = sorted(
+            cells[c], key=lambda i: uncertainty_scores.get(i, 0.0), reverse=True
+        )[:lim]
+        selected.extend(picked)
 
-    # Lấp thêm nếu chưa đủ batch (pool không đủ ảnh thỏa quota)
+    # 4) Fill nếu thiếu (pool không đủ ảnh thỏa quota, hoặc quota không cover hết)
     if len(selected) < batch_size:
-        selected.extend(leftover[: batch_size - len(selected)])
+        used = set(selected)
+        for i in sorted(
+            range(len(metadata_list)),
+            key=lambda i: uncertainty_scores.get(i, 0.0),
+            reverse=True,
+        ):
+            if len(selected) >= batch_size:
+                break
+            if i not in used:
+                selected.append(i)
+                used.add(i)
 
     return selected[:batch_size]
 
