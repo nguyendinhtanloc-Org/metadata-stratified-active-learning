@@ -22,14 +22,76 @@ def stratify_by_metadata(
     return dict(strata)
 
 
+def _waterfill_hamilton_allocation(
+    capacities: Dict[Any, int],
+    weights: Dict[Any, float],
+    total_samples: int,
+) -> Dict[Any, int]:
+    """
+    Phân bổ quota có chặn trần (Constrained Proportional Allocation / Water-filling)
+    kết hợp Largest Remainder Method (Hamilton).
+
+    1. Lặp Water-filling: nhóm nào có exact_quota >= sức chứa còn lại thì khóa ở
+       đúng sức chứa (counts[k]), rồi chia phần dư cho các nhóm còn sức chứa
+       theo đúng tỷ lệ trọng số (tránh lỗi đổ dồn toàn bộ phần dư vào 1 nhóm).
+    2. Làm tròn Hamilton trên các nhóm chưa chạm trần để tổng đúng bằng target.
+    """
+    total_size = sum(capacities.values())
+    if total_size == 0 or total_samples <= 0:
+        return {}
+
+    target = min(total_samples, total_size)
+    if target == total_size:
+        return dict(capacities)
+
+    alloc = {k: 0 for k in capacities}
+    remaining = target
+    uncapped = {k for k, cap in capacities.items() if cap > 0}
+
+    while uncapped and remaining > 0:
+        w_sum = sum(weights[k] for k in uncapped)
+        if w_sum <= 0:
+            break
+        over = [
+            k for k in uncapped
+            if (weights[k] / w_sum) * remaining >= (capacities[k] - alloc[k])
+        ]
+        if not over:
+            break
+        for k in over:
+            remaining -= (capacities[k] - alloc[k])
+            alloc[k] = capacities[k]
+            uncapped.remove(k)
+
+    if uncapped and remaining > 0:
+        w_sum = sum(weights[k] for k in uncapped)
+        remainders = []
+        for k in uncapped:
+            exact = (weights[k] / w_sum) * remaining
+            fl = min(int(math.floor(exact)), capacities[k] - alloc[k])
+            alloc[k] += fl
+            remainders.append((exact - fl, weights[k], k))
+
+        rem = target - sum(alloc.values())
+        remainders.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        for _, _, k in remainders:
+            if rem <= 0:
+                break
+            if alloc[k] < capacities[k]:
+                alloc[k] += 1
+                rem -= 1
+
+    return alloc
+
+
 def allocate_quota(
     strata: Dict[Tuple, List[int]],
     total_samples: int,
     mode: str = "proportional",
 ) -> Dict[Tuple, int]:
     """
-    Phân bổ quota số ảnh cho mỗi stratum bằng Largest Remainder Method
-    (Hamilton), đảm bảo tổng quota = min(total_samples, size_pool).
+    Phân bổ quota số ảnh cho mỗi stratum bằng Water-filling + Largest Remainder
+    Method (Hamilton), đảm bảo tổng quota = min(total_samples, size_pool).
 
     mode:
       - "proportional": quota ∝ kích thước stratum. Giữ nguyên phân phối
@@ -39,77 +101,24 @@ def allocate_quota(
       - "inverse": quota ∝ 1/size -> ưu tiên stratum HIẾM (rare scene,
         adverse weather). Mục tiêu: phủ đều vùng khó thay vì theo phân
         phối gốc (P1).
-
-    Quota luôn bị cap <= size stratum; phần dư sau cap được trả dần cho
-    stratum còn capacity (theo phần dư lớn nhất, tie-break trọng số cao),
-    nên tổng không bao giờ vượt total_samples.
     """
-    total_size = sum(len(indices) for indices in strata.values())
-    if total_size == 0 or total_samples <= 0:
+    capacities = {key: len(indices) for key, indices in strata.items()}
+    if sum(capacities.values()) == 0 or total_samples <= 0:
         return {}
-
-    target = min(total_samples, total_size)
-    if target == total_size:
-        return {key: len(indices) for key, indices in strata.items()}
 
     if mode == "proportional":
         weights = {key: float(len(v)) for key, v in strata.items()}
     elif mode == "equal":
         weights = {key: 1.0 for key in strata}
     elif mode == "inverse":
-        weights = {key: 1.0 / len(v) for key, v in strata.items()}
+        weights = {key: 1.0 / len(v) for key, v in strata.items() if len(v) > 0}
     else:
         raise ValueError(
             f"quota mode chưa hỗ trợ: {mode!r} "
             f"(hỗ trợ: 'proportional', 'equal', 'inverse')"
         )
 
-    weight_sum = sum(weights.values())
-
-    allocation = {}
-    remainders = []
-    allocated_sum = 0
-    for key, indices in strata.items():
-        exact_quota = (weights[key] / weight_sum) * target
-        floor_quota = min(int(math.floor(exact_quota)), len(indices))
-        allocation[key] = floor_quota
-        allocated_sum += floor_quota
-        remainders.append((exact_quota - floor_quota, weights[key], key))
-
-    remaining = target - allocated_sum
-    remainders.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    for _, _, key in remainders:
-        if remaining <= 0:
-            break
-        if allocation[key] < len(strata[key]):
-            allocation[key] += 1
-            remaining -= 1
-
-    # Phần dư sau khi một số tầng bị cap (ví dụ mode="inverse" với tầng hiếm
-    # chỉ còn 10 ảnh) được chia LẠI theo trọng số cho các tầng còn capacity,
-    # thay vì đổ hết vào một tầng tuỳ thứ tự dict (thiên lệch ngẫu nhiên).
-    while remaining > 0:
-        cap_keys = [k for k in strata if allocation[k] < len(strata[k])]
-        if not cap_keys:
-            break
-        w_cap = sum(weights[k] for k in cap_keys)
-        added = 0
-        for k in cap_keys:
-            share = int((weights[k] / w_cap) * remaining)
-            give = min(share, len(strata[k]) - allocation[k])
-            allocation[k] += give
-            added += give
-        remaining -= added
-        if added == 0:
-            # Không chia được theo tỷ lệ (share < 1 cho tất cả) -> tra từng
-            # đơn vị cho tầng có trọng số cao nhất còn capacity.
-            for k in sorted(cap_keys, key=lambda x: weights[x], reverse=True):
-                if remaining <= 0:
-                    break
-                allocation[k] += 1
-                remaining -= 1
-
-    return allocation
+    return _waterfill_hamilton_allocation(capacities, weights, total_samples)
 
 
 def sample_proportional_to_stratum_size(
@@ -217,7 +226,8 @@ def allocate_quota_per_field(
     mode: str = "inverse",
 ) -> Dict[str, Dict[Any, int]]:
     """
-    Tính quota RIÊNG cho từng field (weather / scene / timeofday).
+    Tính quota RIÊNG cho từng field (weather / scene / timeofday) bằng
+    Water-filling + Largest Remainder Method (Hamilton).
 
     Vì sao cần: joint strata (weather x scene x timeofday) tạo ra hàng trăm
     tầng trên BDD100K. Equal/inverse quota trên joint gần như rút ngẫu nhiên
@@ -248,34 +258,11 @@ def allocate_quota_per_field(
         else:  # inverse
             weights = {k: 1.0 / v for k, v in counts.items()}
 
-        w_sum = sum(weights.values())
-        target = min(total_samples, sum(counts.values()))
-
-        alloc = {}
-        remainders = []
-        allocated = 0
-        for key, w in weights.items():
-            exact = (w / w_sum) * target
-            floor_q = min(int(math.floor(exact)), counts[key])
-            alloc[key] = floor_q
-            allocated += floor_q
-            remainders.append((exact - floor_q, w, key))
-
-        remaining = target - allocated
-        remainders.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        for _, _, key in remainders:
-            if remaining <= 0:
-                break
-            if alloc[key] < counts[key]:
-                alloc[key] += 1
-                remaining -= 1
-        if remaining > 0:
-            for _, _, key in remainders:
-                while remaining > 0 and alloc[key] < counts[key]:
-                    alloc[key] += 1
-                    remaining -= 1
-
-        quotas[field] = alloc
+        quotas[field] = _waterfill_hamilton_allocation(
+            capacities=dict(counts),
+            weights=weights,
+            total_samples=total_samples,
+        )
     return quotas
 
 
@@ -320,42 +307,45 @@ def select_balanced_batch(
     """
     Chọn batch thỏa mãn đồng thời quota của từng field, ưu tiên uncertainty cao.
 
-    Thuật toán: IPF (Iterative Proportional Fitting) / Sinkhorn trên các
-    CELL (tổ hợp giá trị của stratify_fields).
+    Thuật toán: Capacity-Constrained IPF (Iterative Proportional Fitting /
+    Sinkhorn) kết hợp Marginal-Respecting Rounding trên các CELL
+    (tổ hợp giá trị của stratify_fields).
 
-    Vì sao KHÔNG dùng greedy AND-gate (bản cũ):
-      Bản cũ duyệt theo uncertainty giảm dần, chỉ nhận ảnh khi MỌI field còn
-      quota. Với nhiều field (weather x scene x timeofday), "nút cổ chai" xảy
-      ra sớm: chỉ ~227/500 ảnh được chọn theo quota, 273 ảnh còn lại fill từ
-      pool (mua uncertainty) -> quota bị phá, entropy field không cải thiện.
-
-    Cách làm (IPF):
-      1. Gom pool thành cells theo (weather, scene, timeofday).
-      2. Weight mỗi cell, lặp ipf_iterations lần: cho mỗi field, điều chỉnh
-         weight cell để marginal theo field tiến tới quota (Sinkhorn-style
-         normalization).
-      3. Sắp xếp cell theo weight giảm, lấy ảnh từ cell cao nhất trước
-         (trần theo min quota của cell), ưu tiên uncertainty cao trong cell.
-      4. Nếu thiếu, fill theo uncertainty (giữ batch_size đúng).
+    Cách làm:
+      1. Gom pool thành cells theo (weather, scene, timeofday) và sắp xếp ảnh
+         bên trong mỗi cell theo uncertainty giảm dần.
+      2. Chạy Capacity-Constrained IPF (ipf_iterations vòng): ở mỗi field,
+         cân chỉnh trọng số cell để tổng biên khớp với quota của field và
+         chặn trần trọng số cell không vượt quá số ảnh thực có len(cells[c]).
+      3. Làm tròn rời rạc có trừ lùi quota (Marginal-Respecting Rounding):
+         tại mỗi bước chọn 1 ảnh từ cell tối ưu hóa theo thứ tự ưu tiên:
+         (a) số trường vẫn còn thiếu quota (rem_quota > 0),
+         (b) số giá trị (hiếm) chưa xuất hiện lần nào trong batch (coverage),
+         (c) độ lệch trọng số IPF còn lại (weights[c] - cell_picked[c]),
+         (d) điểm uncertainty của ảnh tiếp theo trong cell.
     """
-    if not quotas:
+    if not quotas or batch_size <= 0 or not metadata_list:
         return []
 
-    # 1) Gom cells
+    target_batch = min(batch_size, len(metadata_list))
+
+    # 1) Gom cells và sắp xếp ảnh trong từng cell theo uncertainty giảm dần
     cells = defaultdict(list)
     for i, meta in enumerate(metadata_list):
         key = tuple(meta.get(f, "unknown") for f in stratify_fields)
         cells[key].append(i)
+    for c in cells:
+        cells[c].sort(key=lambda i: uncertainty_scores.get(i, 0.0), reverse=True)
     cell_keys = list(cells.keys())
 
-    # 2) Weight ban đầu = mix (uncertainty cao trong cell), rồi IPF
-    weights = {
-        c: (1.0 - uncertainty_weight)
-            + uncertainty_weight * max(
-                (uncertainty_scores.get(i, 0.0) for i in cells[c]), default=0.0
-            )
-        for c in cell_keys
-    }
+    # 2) Capacity-Constrained IPF / Sinkhorn
+    weights = {}
+    for c in cell_keys:
+        mean_u = sum(uncertainty_scores.get(i, 0.0) for i in cells[c]) / len(cells[c])
+        weights[c] = len(cells[c]) * (
+            (1.0 - uncertainty_weight) + uncertainty_weight * mean_u
+        )
+
     alive_count = len(cell_keys)
     for _ in range(ipf_iterations):
         for fi, field in enumerate(stratify_fields):
@@ -366,68 +356,132 @@ def select_balanced_batch(
             for c in cell_keys:
                 value = c[fi]
                 target = field_quota.get(value, 0)
-                # Cell có field value NHIỀU hơn quota -> weight -> 0
-                if target == 0:
+                if target <= 0:
                     weights[c] = 0.0
-                else:
-                    # Tỉ lệ (target * n) / marginal hiện tại:
-                    #   tăng weight cell nếu marginal thấp hơn quota (hiếm),
-                    #   giảm nếu cao hơn. n = batch_size (đơn vị: 1 quota = 1 ảnh).
-                    denom = marginal[value]
-                    if denom > 0:
-                        weights[c] *= (target * batch_size) / denom
-            # Normalization: giữ tổng weight = batch_size để tránh overflow/underflow
-            total = sum(weights.values())
-            if total > 0:
-                scale = batch_size / total
-                for c in cell_keys:
-                    weights[c] *= scale
-        # Chống underflow: nếu có cell "sống" thì quy về, không thì dừng
+                elif marginal[value] > 0:
+                    weights[c] *= target / marginal[value]
+            # Chặn trần theo số ảnh thực có của từng cell để đẩy phần dư sang cell khác
+            for c in cell_keys:
+                if weights[c] > len(cells[c]):
+                    weights[c] = float(len(cells[c]))
         alive_count = sum(1 for c in cell_keys if weights[c] > 0)
         if alive_count == 0:
             break
 
-    # 3) Lấy ảnh theo cell weight giảm, cap theo min quota của cell
-    def cell_cap(c):
-        cap = batch_size
-        for fi, field in enumerate(stratify_fields):
-            cap = min(cap, quotas.get(field, {}).get(c[fi], 0))
-        return cap
-
-    ordered_cells = sorted(cell_keys, key=lambda c: weights[c], reverse=True)
-    selected = []
-    for c in ordered_cells:
-        if len(selected) >= batch_size:
-            break
-        lim = min(cell_cap(c), batch_size - len(selected))
-        if lim <= 0:
-            continue
-        # Trong cell: ưu tiên uncertainty cao
-        picked = sorted(
-            cells[c], key=lambda i: uncertainty_scores.get(i, 0.0), reverse=True
-        )[:lim]
-        selected.extend(picked)
-
-    # 4) Fill nếu thiếu (pool không đủ ảnh thỏa quota, hoặc quota không cover hết)
+    # 3) Làm tròn rời rạc có trừ lùi quota (Marginal-Respecting Rounding)
+    rem_quota = {f: dict(quotas.get(f, {})) for f in stratify_fields}
+    actual_counts = {f: defaultdict(int) for f in stratify_fields}
+    cell_picked = {c: 0 for c in cell_keys}
     n_filled = 0
-    if len(selected) < batch_size:
-        used = set(selected)
-        for i in sorted(
-            range(len(metadata_list)),
-            key=lambda i: uncertainty_scores.get(i, 0.0),
-            reverse=True,
-        ):
-            if len(selected) >= batch_size:
-                break
-            if i not in used:
-                selected.append(i)
-                used.add(i)
-                n_filled += 1
 
-    # 5) Instrumentation: đo mức quota thực sự được tôn trọng.
-    # Ghi ra log để CHỨNG MINH selector có hiệu lực (không phải ước tính).
+    # 3a) Nhận phần nguyên floor(weights[c]) trong giới hạn sức chứa cell và rem_quota
+    for c in sorted(cell_keys, key=lambda c: weights[c], reverse=True):
+        want = int(math.floor(weights[c]))
+        if want <= 0:
+            continue
+        avail_cell = len(cells[c]) - cell_picked[c]
+        avail_q = min(rem_quota[f].get(c[fi], 0) for fi, f in enumerate(stratify_fields))
+        take = min(want, avail_cell, avail_q, target_batch - sum(cell_picked.values()))
+        if take > 0:
+            cell_picked[c] += take
+            for fi, f in enumerate(stratify_fields):
+                actual_counts[f][c[fi]] += take
+                rem_quota[f][c[fi]] -= take
+
+    # 3b) Phân bổ phần lẻ: ưu tiên (số field thiếu quota, độ phủ nhóm mới, phần dư IPF, uncertainty)
+    total_picked = sum(cell_picked.values())
+    for _ in range(target_batch - total_picked):
+        best_c = None
+        best_key = None
+        for c in cell_keys:
+            idx_in_cell = cell_picked[c]
+            if idx_in_cell >= len(cells[c]):
+                continue
+            sat_fields = sum(
+                1 for fi, f in enumerate(stratify_fields)
+                if rem_quota[f].get(c[fi], 0) > 0
+            )
+            new_cov = sum(
+                1 for fi, f in enumerate(stratify_fields)
+                if actual_counts[f][c[fi]] == 0 and quotas[f].get(c[fi], 0) > 0
+            )
+            ipf_rem = weights[c] - idx_in_cell
+            next_u = uncertainty_scores.get(cells[c][idx_in_cell], 0.0)
+            cand_key = (sat_fields, new_cov, ipf_rem, next_u)
+            if best_key is None or cand_key > best_key:
+                best_key = cand_key
+                best_c = c
+
+        if best_c is None:
+            break
+        if best_key[0] < len(stratify_fields):
+            n_filled += 1
+
+        cell_picked[best_c] += 1
+        for fi, f in enumerate(stratify_fields):
+            val = best_c[fi]
+            actual_counts[f][val] += 1
+            if rem_quota[f].get(val, 0) > 0:
+                rem_quota[f][val] -= 1
+
+    # 3c) Hoán đổi cục bộ 1-1 giữa cell thừa và cell thiếu để triệt tiêu sai số làm tròn 3 chiều
+    for _ in range(20):
+        cur_l1 = sum(
+            abs(quotas[f].get(v, 0) - actual_counts[f].get(v, 0))
+            for f in stratify_fields
+            for v in set(quotas[f]) | set(actual_counts[f])
+        )
+        if cur_l1 == 0:
+            break
+        improved = False
+        deficit_cells = [
+            c for c in cell_keys
+            if cell_picked[c] < len(cells[c])
+            and any(actual_counts[f][c[fi]] < quotas[f].get(c[fi], 0)
+                    for fi, f in enumerate(stratify_fields))
+        ]
+        excess_cells = [
+            c for c in cell_keys
+            if cell_picked[c] > 0
+            and any(actual_counts[f][c[fi]] > quotas[f].get(c[fi], 0)
+                    for fi, f in enumerate(stratify_fields))
+        ]
+        for c_add in deficit_cells:
+            for c_rem in excess_cells:
+                if c_add == c_rem:
+                    continue
+                delta = 0
+                for fi, f in enumerate(stratify_fields):
+                    v_add, v_rem = c_add[fi], c_rem[fi]
+                    if v_add == v_rem:
+                        continue
+                    q_add = quotas[f].get(v_add, 0)
+                    q_rem = quotas[f].get(v_rem, 0)
+                    a_add = actual_counts[f][v_add]
+                    a_rem = actual_counts[f][v_rem]
+                    delta += (abs(q_add - (a_add + 1)) - abs(q_add - a_add))
+                    delta += (abs(q_rem - (a_rem - 1)) - abs(q_rem - a_rem))
+                if delta < 0:
+                    cell_picked[c_add] += 1
+                    cell_picked[c_rem] -= 1
+                    for fi, f in enumerate(stratify_fields):
+                        actual_counts[f][c_add[fi]] += 1
+                        actual_counts[f][c_rem[fi]] -= 1
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    selected = []
+    for c in cell_keys:
+        if cell_picked[c] > 0:
+            selected.extend(cells[c][:cell_picked[c]])
+
+    # 4) Instrumentation: đo mức quota thực sự được tôn trọng.
     try:
-        diag = quota_diagnostics(metadata_list, selected[:batch_size],
+        diag = quota_diagnostics(metadata_list, selected[:target_batch],
                                  stratify_fields, quotas)
         parts = ", ".join(
             f"{f}: L1={diag['l1_error'][f]} "
@@ -439,7 +493,7 @@ def select_balanced_batch(
     except Exception as e:
         print(f"[QUOTA] diagnostics failed: {e}", flush=True)
 
-    return selected[:batch_size]
+    return selected[:target_batch]
 
 
 def calculate_batch_diversity(
