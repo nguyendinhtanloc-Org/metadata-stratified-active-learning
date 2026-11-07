@@ -392,3 +392,121 @@ class TestQuotaDiagnostics:
         ent_eq = sum(calc_batch_entropy([pool[i] for i in sel_eq], f) for f in fields)
         ent_inv = sum(calc_batch_entropy([pool[i] for i in sel_inv], f) for f in fields)
         assert ent_eq >= ent_inv, f"equal {ent_eq} < inverse {ent_inv}"
+
+
+class TestBDD100KSkewedDistribution:
+    """
+    Kiểm thử chống hồi quy (regression tests) trực tiếp trên phân phối lệch thực tế
+    của BDD100K (7 weather x 7 scene x 4 timeofday, có các nhóm cực hiếm 1-5 ảnh).
+    """
+
+    @staticmethod
+    def _build_bdd100k_pool(n: int = 2500, seed: int = 42):
+        import random
+        rng = random.Random(seed)
+        weathers = (
+            ["clear"] * 258 + ["undefined"] * 58 + ["snowy"] * 57
+            + ["overcast"] * 54 + ["rainy"] * 49 + ["partly cloudy"] * 23
+            + ["foggy"] * 1
+        )
+        scenes = (
+            ["city street"] * 286 + ["highway"] * 135 + ["residential"] * 70
+            + ["undefined"] * 4 + ["parking lot"] * 3 + ["tunnel"] * 1
+            + ["gas stations"] * 1
+        )
+        times = (
+            ["daytime"] * 258 + ["night"] * 190 + ["dawn/dusk"] * 50
+            + ["undefined"] * 2
+        )
+        pool = [
+            {
+                "weather": rng.choice(weathers),
+                "scene": rng.choice(scenes),
+                "timeofday": rng.choice(times),
+            }
+            for _ in range(n)
+        ]
+        scores = {i: rng.random() for i in range(n)}
+        return pool, scores
+
+    def test_no_remainder_dumping_in_allocate_quota_per_field(self):
+        """
+        Đảm bảo khi nhóm hiếm chạm trần counts[k], phần dư được chia đều/theo
+        trọng số (water-filling) chứ KHÔNG đổ dồn vào 1 nhóm phổ biến.
+        """
+        from sampling.stratified import allocate_quota_per_field
+
+        pool, _ = self._build_bdd100k_pool(n=2500, seed=42)
+        fields = ["weather", "scene", "timeofday"]
+
+        # 1) Mode equal: các nhóm lớn chưa chạm trần chỉ được lệch nhau tối đa 1 ảnh
+        q_eq = allocate_quota_per_field(pool, 500, fields, mode="equal")
+        assert abs(q_eq["scene"]["city street"] - q_eq["scene"]["highway"]) <= 1
+        assert abs(q_eq["scene"]["highway"] - q_eq["scene"]["residential"]) <= 1
+        assert abs(q_eq["timeofday"]["daytime"] - q_eq["timeofday"]["night"]) <= 1
+        assert abs(q_eq["timeofday"]["night"] - q_eq["timeofday"]["dawn/dusk"]) <= 1
+
+        # 2) Mode inverse: nhóm phổ biến nhất ('clear', 'city street', 'daytime')
+        # phải có quota NHỎ HƠN các nhóm trung bình ('rainy', 'highway', 'night'),
+        # tuyệt đối không bị đổ dồn >200 quota như lỗi cũ.
+        q_inv = allocate_quota_per_field(pool, 500, fields, mode="inverse")
+        assert q_inv["weather"]["clear"] < q_inv["weather"]["rainy"]
+        assert q_inv["scene"]["city street"] < q_inv["scene"]["highway"]
+        assert q_inv["timeofday"]["daytime"] < q_inv["timeofday"]["night"]
+
+    def test_equal_per_field_zero_l1_and_full_coverage_on_bdd100k(self):
+        """
+        Trên phân phối BDD100K (2500 ảnh, chọn 500), quota_mode='equal' + 'per_field'
+        phải đạt L1 = 0 trên cả 3 trường, phủ 100% giá trị và tổng entropy > 6.0 bits.
+        """
+        from sampling.stratified import (
+            allocate_quota_per_field,
+            select_balanced_batch,
+            quota_diagnostics,
+            calculate_batch_diversity,
+        )
+
+        pool, scores = self._build_bdd100k_pool(n=2500, seed=42)
+        fields = ["weather", "scene", "timeofday"]
+        quotas = allocate_quota_per_field(pool, 500, fields, mode="equal")
+        selected = select_balanced_batch(pool, scores, 500, fields, quotas)
+
+        assert len(selected) == 500
+        assert len(set(selected)) == 500
+
+        diag = quota_diagnostics(pool, selected, fields, quotas)
+        for f in fields:
+            assert diag["l1_error"][f] == 0, f"{f} L1={diag['l1_error'][f]} != 0"
+            assert diag["unique"][f] == diag["n_unique_values"][f]
+
+        div = calculate_batch_diversity(pool, selected, fields)
+        assert div["weather"] > 2.4
+        assert div["scene"] > 1.8
+        assert div["timeofday"] > 1.5
+        assert sum(div.values()) > 6.0
+
+    def test_inverse_per_field_full_coverage_and_no_collapse(self):
+        """
+        Mode 'inverse' + 'per_field' phải phủ đủ 100% giá trị hiếm trong pool
+        và không trường nào bị sập entropy xuống dưới 1.5 bits.
+        """
+        from sampling.stratified import (
+            allocate_quota_per_field,
+            select_balanced_batch,
+            quota_diagnostics,
+            calculate_batch_diversity,
+        )
+
+        pool, scores = self._build_bdd100k_pool(n=2500, seed=42)
+        fields = ["weather", "scene", "timeofday"]
+        quotas = allocate_quota_per_field(pool, 500, fields, mode="inverse")
+        selected = select_balanced_batch(pool, scores, 500, fields, quotas)
+
+        assert len(selected) == 500
+        diag = quota_diagnostics(pool, selected, fields, quotas)
+        for f in fields:
+            assert diag["unique"][f] == diag["n_unique_values"][f]
+
+        div = calculate_batch_diversity(pool, selected, fields)
+        for f in fields:
+            assert div[f] > 1.5, f"{f} entropy collapsed to {div[f]}"
