@@ -279,6 +279,35 @@ def allocate_quota_per_field(
     return quotas
 
 
+def quota_diagnostics(
+    metadata_list: List[Dict],
+    selected_indices: List[int],
+    stratify_fields: List[str],
+    quotas: Dict[str, Dict[Any, int]],
+) -> Dict[str, Any]:
+    """
+    Đo mức độ QUOTA được tôn trọng thực tế (để ghi log, không dùng để chọn).
+
+    Trả về:
+      - l1_error[field] : tổng |quota - actual| (0 = quota đúng tuyệt đối)
+      - unique[field]   : số giá trị khác nhau thực sự có trong batch
+      - n_unique_values[field] : số giá trị có trong pool
+    """
+    diag: Dict[str, Any] = {}
+    for field in stratify_fields:
+        actual = defaultdict(int)
+        for i in selected_indices:
+            actual[metadata_list[i].get(field, "unknown")] += 1
+        q = quotas.get(field, {})
+        l1 = sum(abs(q.get(v, 0) - actual.get(v, 0))
+                 for v in set(q) | set(actual))
+        pool_values = {m.get(field, "unknown") for m in metadata_list}
+        diag.setdefault("l1_error", {})[field] = l1
+        diag.setdefault("unique", {})[field] = len(actual)
+        diag.setdefault("n_unique_values", {})[field] = len(pool_values)
+    return diag
+
+
 def select_balanced_batch(
     metadata_list: List[Dict],
     uncertainty_scores: Dict[int, float],
@@ -327,6 +356,7 @@ def select_balanced_batch(
             )
         for c in cell_keys
     }
+    alive_count = len(cell_keys)
     for _ in range(ipf_iterations):
         for fi, field in enumerate(stratify_fields):
             field_quota = quotas.get(field, {})
@@ -353,8 +383,8 @@ def select_balanced_batch(
                 for c in cell_keys:
                     weights[c] *= scale
         # Chống underflow: nếu có cell "sống" thì quy về, không thì dừng
-        alive = sum(1 for c in cell_keys if weights[c] > 0)
-        if alive == 0:
+        alive_count = sum(1 for c in cell_keys if weights[c] > 0)
+        if alive_count == 0:
             break
 
     # 3) Lấy ảnh theo cell weight giảm, cap theo min quota của cell
@@ -379,6 +409,7 @@ def select_balanced_batch(
         selected.extend(picked)
 
     # 4) Fill nếu thiếu (pool không đủ ảnh thỏa quota, hoặc quota không cover hết)
+    n_filled = 0
     if len(selected) < batch_size:
         used = set(selected)
         for i in sorted(
@@ -391,6 +422,22 @@ def select_balanced_batch(
             if i not in used:
                 selected.append(i)
                 used.add(i)
+                n_filled += 1
+
+    # 5) Instrumentation: đo mức quota thực sự được tôn trọng.
+    # Ghi ra log để CHỨNG MINH selector có hiệu lực (không phải ước tính).
+    try:
+        diag = quota_diagnostics(metadata_list, selected[:batch_size],
+                                 stratify_fields, quotas)
+        parts = ", ".join(
+            f"{f}: L1={diag['l1_error'][f]} "
+            f"uniq={diag['unique'][f]}/{diag['n_unique_values'][f]}"
+            for f in stratify_fields
+        )
+        print(f"[QUOTA] {parts} | fill={n_filled} | cells_alive={alive_count}",
+              flush=True)
+    except Exception as e:
+        print(f"[QUOTA] diagnostics failed: {e}", flush=True)
 
     return selected[:batch_size]
 

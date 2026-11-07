@@ -323,3 +323,72 @@ class TestQuotaDiversityGain:
         ent_prop = calc_batch_entropy([meta[i] for i in sel_prop], "scene")
         ent_inv = calc_batch_entropy([meta[i] for i in sel_inv], "scene")
         assert ent_inv > ent_prop, f"inverse {ent_inv} <= proportional {ent_prop}"
+
+
+class TestQuotaDiagnostics:
+    """Test instrumentation đo mức quota được tôn trọng (để chứng minh trong log)."""
+
+    def _pool(self):
+        return ([{"weather": "clear", "scene": "street", "timeofday": "daytime"}] * 80
+                + [{"weather": "rainy", "scene": "tunnel", "timeofday": "night"}] * 20)
+
+    def test_diagnostics_reports_l1_and_unique(self):
+        """Diagnostics trả về L1 error + số giá trị unique cho từng field."""
+        from sampling.stratified import (
+            allocate_quota_per_field, select_balanced_batch, quota_diagnostics)
+
+        pool = self._pool()
+        scores = {i: 1.0 - i * 0.001 for i in range(len(pool))}
+        quotas = allocate_quota_per_field(
+            pool, 20, ["weather", "scene", "timeofday"], mode="equal")
+        selected = select_balanced_batch(
+            pool, scores, 20, ["weather", "scene", "timeofday"], quotas)
+
+        diag = quota_diagnostics(pool, selected, ["weather", "scene", "timeofday"], quotas)
+
+        for f in ("weather", "scene", "timeofday"):
+            assert f in diag["l1_error"]
+            assert f in diag["unique"]
+            assert f in diag["n_unique_values"]
+            assert diag["l1_error"][f] >= 0
+            assert diag["unique"][f] <= diag["n_unique_values"][f]
+
+    def test_diagnostics_l1_zero_when_quota_met(self):
+        """Khi quota được tôn trọng tuyệt đối thì L1 = 0."""
+        from sampling.stratified import (
+            allocate_quota_per_field, select_balanced_batch, quota_diagnostics)
+
+        # pool đồng nhất 2 giá trị mỗi field -> quota khả thi, L1 = 0
+        pool = []
+        for i in range(40):
+            pool.append({"weather": "clear" if i % 2 == 0 else "rainy",
+                         "scene": "street" if i % 2 == 0 else "tunnel",
+                         "timeofday": "daytime" if i % 2 == 0 else "night"})
+        scores = {i: 1.0 - i * 0.001 for i in range(len(pool))}
+        quotas = allocate_quota_per_field(
+            pool, 20, ["weather", "scene", "timeofday"], mode="equal")
+        selected = select_balanced_batch(
+            pool, scores, 20, ["weather", "scene", "timeofday"], quotas)
+
+        diag = quota_diagnostics(pool, selected, ["weather", "scene", "timeofday"], quotas)
+        assert diag["l1_error"]["weather"] == 0
+        assert diag["l1_error"]["scene"] == 0
+        assert diag["l1_error"]["timeofday"] == 0
+
+    def test_equal_mode_beats_inverse_on_entropy(self):
+        """equal quota cho entropy cao hơn inverse (inverse tạo phân bố nghiêng)."""
+        from sampling.stratified import stratified_sampling
+        from metrics.entropy import calc_batch_entropy
+
+        pool = self._pool()
+        scores = {i: 1.0 - i * 0.001 for i in range(len(pool))}
+        fields = ["weather", "scene", "timeofday"]
+
+        sel_eq = stratified_sampling(
+            pool, scores, 20, fields, quota_mode="equal", quota_scope="per_field")
+        sel_inv = stratified_sampling(
+            pool, scores, 20, fields, quota_mode="inverse", quota_scope="per_field")
+
+        ent_eq = sum(calc_batch_entropy([pool[i] for i in sel_eq], f) for f in fields)
+        ent_inv = sum(calc_batch_entropy([pool[i] for i in sel_inv], f) for f in fields)
+        assert ent_eq >= ent_inv, f"equal {ent_eq} < inverse {ent_inv}"

@@ -440,6 +440,7 @@ class ActiveLearningLoop:
                 quota_scope=self.quota_scope
             )
 
+
         selected_indices = [pool_indices[i] for i in selected_local]
         diversity = calculate_batch_diversity(
             self.filtered_metadata,
