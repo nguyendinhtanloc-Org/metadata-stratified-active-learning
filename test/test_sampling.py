@@ -510,3 +510,65 @@ class TestBDD100KSkewedDistribution:
         div = calculate_batch_diversity(pool, selected, fields)
         for f in fields:
             assert div[f] > 1.5, f"{f} entropy collapsed to {div[f]}"
+
+    def test_sqrt_per_field_pareto_balance_on_correlated_bdd100k(self):
+        """
+        Mode 'sqrt' + hybrid_top_k_ratio=3 trên pool BDD100K có tương quan
+        uncertainty với scene: phải đạt L1 = 0, entropy cao vượt trội so với
+        baseline, đồng thời giữ điểm uncertainty trung bình cao hơn 'equal'.
+        """
+        import random
+        from sampling.stratified import (
+            stratified_sampling,
+            allocate_quota_per_field,
+            quota_diagnostics,
+            calculate_batch_diversity,
+        )
+        from sampling.baseline import baseline_sampling
+
+        pool, _ = self._build_bdd100k_pool(n=5000, seed=42)
+        rng = random.Random(42)
+        scores = {
+            i: max(
+                0.0,
+                min(
+                    3.32,
+                    rng.gauss(1.8, 0.35)
+                    + (0.36 if pool[i]["scene"] == "city street" else 0.0)
+                    + (0.12 if pool[i]["timeofday"] in ("daytime", "night") else 0.0),
+                ),
+            )
+            for i in range(len(pool))
+        }
+        fields = ["weather", "scene", "timeofday"]
+
+        b_sel = baseline_sampling(scores, 500, pool, fields)
+        s_sqrt = stratified_sampling(
+            pool, scores, 500, fields,
+            hybrid_top_k_ratio=3, quota_mode="sqrt", quota_scope="per_field",
+        )
+        s_eq = stratified_sampling(
+            pool, scores, 500, fields,
+            hybrid_top_k_ratio=5, quota_mode="equal", quota_scope="per_field",
+        )
+
+        assert len(s_sqrt) == 500
+        assert len(set(s_sqrt)) == 500
+
+        b_ent = sum(calculate_batch_diversity(pool, b_sel, fields).values())
+        sqrt_ent = sum(calculate_batch_diversity(pool, s_sqrt, fields).values())
+        assert sqrt_ent > b_ent + 1.0, f"sqrt_ent={sqrt_ent} not >> b_ent={b_ent}"
+
+        u_sqrt = sum(scores[i] for i in s_sqrt) / 500
+        u_eq = sum(scores[i] for i in s_eq) / 500
+        assert u_sqrt > u_eq, f"u_sqrt={u_sqrt} <= u_eq={u_eq}"
+
+        # Kiểm tra trực tiếp L1 = 0 trên sub-pool Top-1500 của mode='sqrt'
+        top_1500 = sorted(range(len(pool)), key=lambda i: scores[i], reverse=True)[:1500]
+        sub_pool = [pool[i] for i in top_1500]
+        quotas = allocate_quota_per_field(sub_pool, 500, fields, mode="sqrt")
+        remap = {old: new for new, old in enumerate(top_1500)}
+        diag = quota_diagnostics(sub_pool, [remap[i] for i in s_sqrt], fields, quotas)
+        for f in fields:
+            assert diag["l1_error"][f] == 0, f"{f} L1={diag['l1_error'][f]} != 0"
+
