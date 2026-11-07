@@ -97,6 +97,8 @@ def allocate_quota(
       - "proportional": quota ∝ kích thước stratum. Giữ nguyên phân phối
         metadata của pool -> KHÔNG cải thiện coverage cho stratum hiếm
         (hành vi cũ, giữ để so sánh).
+      - "sqrt": quota ∝ sqrt(size) -> cân bằng Pareto giữa tần suất gốc và
+        chia đều (nâng mạnh nhóm hiếm nhưng không làm cạn kiệt nhóm đa số).
       - "equal": quota chia đều giữa các stratum, cap ở size stratum.
       - "inverse": quota ∝ 1/size -> ưu tiên stratum HIẾM (rare scene,
         adverse weather). Mục tiêu: phủ đều vùng khó thay vì theo phân
@@ -108,6 +110,8 @@ def allocate_quota(
 
     if mode == "proportional":
         weights = {key: float(len(v)) for key, v in strata.items()}
+    elif mode == "sqrt":
+        weights = {key: math.sqrt(len(v)) for key, v in strata.items() if len(v) > 0}
     elif mode == "equal":
         weights = {key: 1.0 for key in strata}
     elif mode == "inverse":
@@ -115,7 +119,7 @@ def allocate_quota(
     else:
         raise ValueError(
             f"quota mode chưa hỗ trợ: {mode!r} "
-            f"(hỗ trợ: 'proportional', 'equal', 'inverse')"
+            f"(hỗ trợ: 'proportional', 'sqrt', 'equal', 'inverse')"
         )
 
     return _waterfill_hamilton_allocation(capacities, weights, total_samples)
@@ -134,7 +138,7 @@ def stratified_sampling(
     uncertainty_scores: Dict[int, float],
     batch_size: int,
     stratify_fields: List[str] = ["weather", "scene", "timeofday"],
-    hybrid_top_k_ratio: int = 0,
+    hybrid_top_k_ratio: float = 0,
     quota_mode: str = "proportional",
     quota_scope: str = "joint",
 ) -> List[int]:
@@ -142,7 +146,7 @@ def stratified_sampling(
 
     hybrid_top_k_ratio > 0 bật chế độ HYBRID (Top-K filtering):
       1. Lọc Top-K ảnh khó nhất (uncertainty cao nhất) trên toàn bộ candidate pool,
-         K = batch_size * hybrid_top_k_ratio.
+         K = int(round(batch_size * hybrid_top_k_ratio)).
       2. CHỈ trong Top-K đó mới phân tầng metadata + phân bổ quota.
       3. Trong mỗi tầng, lấy top theo uncertainty.
 
@@ -156,6 +160,7 @@ def stratified_sampling(
 
     quota_mode (P1):
       - "proportional" (default, hành vi cũ): quota theo kích thước stratum.
+      - "sqrt": quota ∝ sqrt(size), cân bằng Pareto giữa tần suất gốc và chia đều.
       - "inverse": quota ∝ 1/size, ưu tiên stratum hiếm.
       - "equal": quota chia đều.
 
@@ -163,11 +168,11 @@ def stratified_sampling(
       - "joint" (default): một tầng = tổ hợp (weather, scene, timeofday).
       - "per_field": quota tính RIÊNG cho từng field, batch chọn thỏa mãn
         đồng thời mọi quota field -> cân bằng được diversity đo theo từng field
-        (đúng metric đang báo cáo). "per_field" chỉ dùng với quota_mode
-        "inverse"/"equal".
+        (đúng metric đang báo cáo). "per_field" dùng với quota_mode
+        "sqrt"/"inverse"/"equal".
     """
     if hybrid_top_k_ratio and hybrid_top_k_ratio > 0:
-        k = min(len(metadata_list), batch_size * hybrid_top_k_ratio)
+        k = min(len(metadata_list), int(round(batch_size * hybrid_top_k_ratio)))
         top_k = sorted(
             range(len(metadata_list)),
             key=lambda i: uncertainty_scores.get(i, 0.0),
@@ -188,7 +193,7 @@ def stratified_sampling(
             raise ValueError(
                 "quota_scope='per_field' không dùng được với quota_mode='proportional' "
                 "(proportional theo field = proportional theo joint về mặt quota). "
-                "Dùng 'inverse' hoặc 'equal'."
+                "Dùng 'sqrt', 'inverse' hoặc 'equal'."
             )
         quotas = allocate_quota_per_field(
             metadata_list, batch_size, stratify_fields, mode=quota_mode
@@ -238,9 +243,9 @@ def allocate_quota_per_field(
     quota đó (xem select_balanced_batch).
 
     mode: "inverse" (ưu tiên giá trị hiếm), "equal" (chia đều),
-          "proportional" (theo tần suất gốc).
+          "sqrt" (căn bậc hai tần suất), "proportional" (theo tần suất gốc).
     """
-    if mode not in ("inverse", "equal", "proportional"):
+    if mode not in ("inverse", "equal", "sqrt", "proportional"):
         raise ValueError(f"quota mode chưa hỗ trợ: {mode!r}")
 
     quotas = {}
@@ -253,10 +258,12 @@ def allocate_quota_per_field(
 
         if mode == "proportional":
             weights = {k: float(v) for k, v in counts.items()}
+        elif mode == "sqrt":
+            weights = {k: math.sqrt(v) for k, v in counts.items() if v > 0}
         elif mode == "equal":
             weights = {k: 1.0 for k in counts}
         else:  # inverse
-            weights = {k: 1.0 / v for k, v in counts.items()}
+            weights = {k: 1.0 / v for k, v in counts.items() if v > 0}
 
         quotas[field] = _waterfill_hamilton_allocation(
             capacities=dict(counts),
