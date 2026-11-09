@@ -100,9 +100,8 @@ def allocate_quota(
       - "sqrt": quota ∝ sqrt(size) -> cân bằng Pareto giữa tần suất gốc và
         chia đều (nâng mạnh nhóm hiếm nhưng không làm cạn kiệt nhóm đa số).
       - "equal": quota chia đều giữa các stratum, cap ở size stratum.
-      - "inverse": quota ∝ 1/size -> ưu tiên stratum HIẾM (rare scene,
-        adverse weather). Mục tiêu: phủ đều vùng khó thay vì theo phân
-        phối gốc (P1).
+      - "inverse": quota ∝ 1/size -> ưu tiên stratum hiếm (mục tiêu phủ rộng
+        các điều kiện ít gặp như rare scene, adverse weather).
     """
     capacities = {key: len(indices) for key, indices in strata.items()}
     if sum(capacities.values()) == 0 or total_samples <= 0:
@@ -158,11 +157,11 @@ def stratified_sampling(
 
     hybrid_top_k_ratio = 0 -> hành vi cũ (giữ để ablation).
 
-    quota_mode (P1):
-      - "proportional" (default, hành vi cũ): quota theo kích thước stratum.
+    quota_mode:
+      - "proportional" (default): quota theo kích thước stratum gốc.
       - "sqrt": quota ∝ sqrt(size), cân bằng Pareto giữa tần suất gốc và chia đều.
       - "inverse": quota ∝ 1/size, ưu tiên stratum hiếm.
-      - "equal": quota chia đều.
+      - "equal": quota chia đều giữa các nhóm.
 
     quota_scope:
       - "joint" (default): một tầng = tổ hợp (weather, scene, timeofday).

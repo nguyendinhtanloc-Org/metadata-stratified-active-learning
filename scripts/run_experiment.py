@@ -58,19 +58,22 @@ def run_experiment(
     print(f"Device: {device}")
     print(f"=" * 50)
 
-    # Monkey-patch stratified_sampling nếu là baseline
+    # Cấu hình pipeline sampling
     if pipeline == "baseline":
         import active_learning.loop as loop_module
-        loop_module.stratified_sampling = baseline_sampling
-        print("[INFO] Using baseline (uncertainty-only) sampling")
+        loop_module.baseline_sampling = baseline_sampling
+        config["use_baseline"] = True
+        print("[INFO] Pipeline: baseline (uncertainty-only)")
+    else:
+        config["use_baseline"] = False
+        print("[INFO] Pipeline: stratified (metadata-guided)")
 
-    # Initialize AL loop
+    # Khởi tạo và thực thi Active Learning Loop
     al_loop = ActiveLearningLoop(config, experiment_name)
 
-    # Run
     results_df = al_loop.run(
         metadata_path=METADATA_PATH,
-        image_dir=IMAGE_DIR
+        image_dirs=[IMAGE_DIR]
     )
     
     print("\nFinal Results:")

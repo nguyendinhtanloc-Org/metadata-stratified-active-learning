@@ -90,21 +90,22 @@ class ActiveLearningLoop:
         self.predict_batch_size = config.get("predict_batch_size", 128)
         self.predict_workers = config.get("predict_workers", 0)
         self.predict_imgsz = config.get("predict_imgsz", 640)
-        # Giải pháp A: Candidate sub-pool (None hoặc <=0 sẽ quét toàn bộ 59k ảnh)
+        # Candidate sub-pool size (None hoặc <=0 sẽ quét toàn bộ pool ảnh chưa gán nhãn)
         self.candidate_pool_size = config.get("candidate_pool_size", 15000)
         # Hybrid Top-K filtering cho stratified sampling:
-        #   0  = phân tầng trên toàn bộ candidate pool (hành vi cũ)
-        #   >0 = lọc Top-(batch_size * ratio) ảnh khó nhất TRƯỚC, rồi mới
-        #        phân tầng bên trong tập ảnh khó (xem sampling/stratified.py)
-        # Dùng để ablation: bật/tắt bằng 1 dòng config.
+        #   0  = phân tầng trên toàn bộ candidate pool
+        #   >0 = lọc Top-(batch_size * ratio) ảnh có uncertainty cao nhất trước,
+        #        rồi mới phân tầng metadata bên trong tập ảnh khó này
         self.hybrid_top_k_ratio = config.get("hybrid_top_k_ratio", 0)
-        # P1: quota mode cho stratified sampling.
-        #   "proportional" (cũ): quota ∝ size stratum -> giữ nguyên phân phối gốc.
-        #   "inverse": quota ∝ 1/size -> ưu tiên stratum hiếm (mục tiêu coverage).
-        #   "equal": quota chia đều.
+        # Chế độ phân bổ quota cho stratified sampling:
+        #   "proportional": quota ∝ kích thước stratum gốc
+        #   "sqrt": quota ∝ sqrt(kích thước stratum) - cân bằng Pareto
+        #   "equal": quota chia đều giữa các stratum
+        #   "inverse": quota ∝ 1 / kích thước stratum - ưu tiên nhóm hiếm
         self.quota_mode = config.get("quota_mode", "proportional")
-        # quota_scope: "joint" (1 tầng = tổ hợp field) | "per_field"
-        # (quota riêng cho từng field -> cân bằng diversity đo theo field).
+        # Phạm vi quota:
+        #   "joint": tổ hợp (weather x scene x timeofday)
+        #   "per_field": quota riêng cho từng trục metadata độc lập
         self.quota_scope = config.get("quota_scope", "joint")
 
         self.local_image_cache = config.get("local_image_cache", None)
@@ -377,7 +378,7 @@ class ActiveLearningLoop:
 
         all_unlabeled_sorted = sorted(self.unlabeled_indices)
 
-        # GIẢI PHÁP A: Candidate Sub-pool Sampling (Tăng tốc gấp 4 lần & tạo phương sai tự nhiên theo seed)
+        # Candidate Sub-pool Sampling: lấy mẫu ngẫu nhiên có kiểm soát hạt giống (seed * 1000 + round)
         if self.candidate_pool_size and 0 < self.candidate_pool_size < len(all_unlabeled_sorted):
             round_rng = random.Random(self.seed * 1000 + round_num)
             candidate_indices = sorted(round_rng.sample(all_unlabeled_sorted, self.candidate_pool_size))
@@ -548,11 +549,7 @@ class ActiveLearningLoop:
         checkpoint_path = str(output_path / "checkpoint.pkl")
         results_csv_path = str(output_path / "results.csv")
 
-        # BƯỚC 2 (domain-specific evaluation): dump metadata của eval set
-        # CỐ ĐỊNH (2000 ảnh, seed 2024) ra CSV -> notebook join với
-        # predictions.csv của ultralytics theo 'filename' để tính mAP
-        # riêng theo domain (night / adverse weather / rare scene).
-        # Idempotent: mọi experiment đều ghi cùng nội dung (cùng eval set).
+        # Xuất metadata của tập kiểm thử cố định (_shared_eval) phục vụ đánh giá theo miền
         if self.eval_indices:
             import pandas as pd
             em = [self.filtered_metadata[i] for i in self.eval_indices]
@@ -573,7 +570,7 @@ class ActiveLearningLoop:
         print(f"Rounds: {self.num_rounds}, Batch size: {self.batch_size}")
         print(f"==================================================")
 
-        # BUGFIX: Xác định đúng round tiếp theo cần chạy từ results_history
+        # Xác định round tiếp theo cần thực hiện từ results_history
         next_round = 0
         if Path(checkpoint_path).exists():
             try:

@@ -162,7 +162,7 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 class TestAllocateQuotaModes:
-    """Test các mode quota mới (P1) - inverse/equal thay cho proportional."""
+    """Kiểm tra các chế độ phân bổ quota (proportional, equal, sqrt, inverse)."""
 
     def test_inverse_favours_rare_strata(self):
         """Quota inverse phải cho tầng hiếm NHIỀU hơn so với proportional."""
@@ -239,7 +239,7 @@ class TestAllocateQuotaModes:
 
 
 class TestPerFieldQuota:
-    """Test quota_scope='per_field' (P1): quota riêng cho từng field."""
+    """Kiểm tra quota_scope='per_field': phân bổ quota riêng cho từng trục metadata độc lập."""
 
     def _make_metadata(self):
         # 1 scene phổ biến (street) x 8, 1 scene hiếm (tunnel) x 2
@@ -302,10 +302,10 @@ class TestPerFieldQuota:
 
 
 class TestQuotaDiversityGain:
-    """Kiểm chứng mục tiêu của P1: quota inverse làm TĂNG entropy theo field."""
+    """Kiểm chứng mục tiêu tối ưu: quota inverse/equal/sqrt làm tăng Shannon entropy theo trường."""
 
     def test_inverse_improves_scene_entropy_vs_proportional(self):
-        """Trên pool lệch mạnh, inverse phải cho entropy scene CAO HƠN proportional."""
+        """Trên pool lệch mạnh, inverse cho entropy scene cao hơn proportional."""
         from sampling.stratified import stratified_sampling
         from metrics.entropy import calc_batch_entropy
 

@@ -1,12 +1,112 @@
 """
 Statistical Analysis Module cho Active Learning experiments.
-Bao gồm: paired t-test, correlation analysis, result aggregation.
+Bao gồm: paired t-test, Cohen's d, correlation analysis (Pearson/Spearman),
+partial correlation (kiểm soát round/pipeline), và result aggregation.
 """
 
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Union
 import numpy as np
 from scipy import stats
 import pandas as pd
+
+
+def compute_cohens_d(
+    x: Union[List[float], np.ndarray],
+    y: Union[List[float], np.ndarray],
+    paired: bool = True
+) -> float:
+    """
+    Tính Cohen's d để đo lường effect size.
+
+    Args:
+        x: Mẫu 1 (ví dụ: stratified values)
+        y: Mẫu 2 (ví dụ: baseline values)
+        paired: True nếu là paired samples (cùng seed/round), False nếu độc lập
+
+    Returns:
+        Giá trị Cohen's d (|d| < 0.2: rất nhỏ, ~0.5: trung bình, >0.8: lớn)
+    """
+    arr_x = np.asarray(x, dtype=float)
+    arr_y = np.asarray(y, dtype=float)
+
+    if len(arr_x) != len(arr_y):
+        raise ValueError("Hai mẫu phải có cùng độ dài để tính paired Cohen's d")
+
+    if paired:
+        diff = arr_x - arr_y
+        if np.allclose(diff, 0.0):
+            return 0.0
+        sd_diff = float(np.std(diff, ddof=1))
+        if sd_diff == 0.0:
+            return 0.0
+        return float(np.mean(diff) / sd_diff)
+    else:
+        n1, n2 = len(arr_x), len(arr_y)
+        var1 = np.var(arr_x, ddof=1)
+        var2 = np.var(arr_y, ddof=1)
+        pooled_se = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+        if pooled_se == 0.0:
+            return 0.0
+        return float((np.mean(arr_x) - np.mean(arr_y)) / pooled_se)
+
+
+def _ols_residuals(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """Tính residuals của biến y sau khi hồi quy tuyến tính OLS trên ma trận X."""
+    X_design = np.column_stack([np.ones(len(y)), X])
+    beta, *_ = np.linalg.lstsq(X_design, y, rcond=None)
+    return y - X_design @ beta
+
+
+def partial_correlation(
+    x: Union[List[float], np.ndarray],
+    y: Union[List[float], np.ndarray],
+    covariates: Union[List[List[float]], np.ndarray]
+) -> Dict[str, float]:
+    """
+    Tính Partial Correlation giữa x và y khi đã kiểm soát ảnh hưởng của covariates Z.
+    Ứng dụng để kiểm tra liệu entropy cao có thực sự tăng mAP sau khi loại trừ
+    confounding factor (round tiến triển và pipeline).
+
+    Args:
+        x: Biến độc lập (ví dụ: total_entropy)
+        y: Biến phụ thuộc (ví dụ: map50)
+        covariates: Ma trận n x m chứa các biến kiểm soát (ví dụ: dummy round, dummy pipeline)
+
+    Returns:
+        Dict chứa 'r_partial', 'p_value', 'dof', 't_statistic'
+    """
+    arr_x = np.asarray(x, dtype=float)
+    arr_y = np.asarray(y, dtype=float)
+    Z = np.asarray(covariates, dtype=float)
+
+    if Z.ndim == 1:
+        Z = Z.reshape(-1, 1)
+
+    n, m = Z.shape
+    if len(arr_x) != n or len(arr_y) != n:
+        raise ValueError(f"Độ dài x ({len(arr_x)}), y ({len(arr_y)}) và covariates ({n}) không khớp")
+
+    rx = _ols_residuals(arr_x, Z)
+    ry = _ols_residuals(arr_y, Z)
+
+    denom = np.sqrt((rx @ rx) * (ry @ ry))
+    if denom == 0.0:
+        return {"r_partial": np.nan, "p_value": np.nan, "dof": n - m - 2, "t_statistic": np.nan}
+
+    r = float(rx @ ry / denom)
+    dof = n - m - 2
+    if dof <= 0:
+        return {"r_partial": r, "p_value": np.nan, "dof": dof, "t_statistic": np.nan}
+
+    t_val = r * np.sqrt(dof / max(1e-12, 1.0 - r * r))
+    p_val = float(2.0 * stats.t.sf(abs(t_val), dof))
+
+    return {
+        "r_partial": r,
+        "p_value": p_val,
+        "dof": int(dof),
+        "t_statistic": float(t_val)
+    }
 
 
 def paired_ttest(
