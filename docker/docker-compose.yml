@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  active-learning:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ms-active-learning
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/app/src
+    volumes:
+      - ../data:/app/data
+      - ../results:/app/results
+      - ../experiments:/app/experiments
+      - ../checkpoints:/app/checkpoints
+    command: bash -c "pytest test/ -v"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

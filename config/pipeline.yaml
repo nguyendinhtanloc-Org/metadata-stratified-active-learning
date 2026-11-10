@@ -1,0 +1,39 @@
+# ==============================================================================
+# Pipeline Configuration for Metadata-Stratified Active Learning
+# Verified settings matching main experiments (Commit 610b186)
+# ==============================================================================
+
+experiment:
+  name: "metadata_stratified_active_learning"
+  description: "Comparing Uncertainty Baseline vs IPF Metadata-Stratified AL on BDD100K"
+  seeds: [42, 123, 456]
+  num_rounds: 2
+  output_dir: "results/main_experiment"
+
+dataset:
+  name: "BDD100K"
+  train_annotations: "data/raw/annotations/bdd100k_labels_images_train.json"
+  val_annotations: "data/raw/annotations/bdd100k_labels_images_val.json"
+  image_dir: "data/raw/images/100k/train"
+  num_classes: 10
+  eval_set_size: 2000
+
+active_learning:
+  initial_budget: 500       # Round 0 random init
+  batch_size: 500           # Budget per round (R1: 1000 total, R2: 1500 total)
+  uncertainty_metric: "entropy"  # Options: entropy, margin, least_confidence
+
+sampling:
+  stratify_fields: ["weather", "scene", "timeofday"]
+  quota_mode: "sqrt"        # Sqrt allocation (alpha = 0.5): Pareto optimal
+  hybrid_top_k_ratio: 3     # Top-3x uncertainty pool candidate filtering
+  ipf_max_iter: 10
+  ipf_tolerance: 0.01
+
+model:
+  architecture: "yolov8n.pt"
+  epochs: 15
+  imgsz: 640
+  batch_size: 16
+  device: 0                 # GPU index or "cpu"
+  workers: 8
