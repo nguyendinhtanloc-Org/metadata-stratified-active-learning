@@ -1,0 +1,11 @@
+# Database configuration for local metadata cataloging (optional)
+database:
+  driver: "postgresql"
+  host: "localhost"
+  port: 5432
+  database: "bdd100k"
+  username: "postgres"
+  password: "postgres_password"
+  pool_size: 5
+  echo_sql: false
+

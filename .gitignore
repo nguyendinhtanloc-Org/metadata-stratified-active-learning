@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (large files - use DVC or git-lfs)
+data/raw/
+data/interim/
+data/processed/
+data/external/
+
+# MLflow
+mlruns/
+
+# Experiment outputs
+experiments/runs/*/checkpoints/
+experiments/runs/*/logs/
+experiments/runs/*/model_artifacts/
+
+# Results (generated)
+results/figures/
+results/tables/
+
+# Reports
+report/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
