@@ -8,3 +8,4 @@ database:
   password: "postgres_password"
   pool_size: 5
   echo_sql: false
+

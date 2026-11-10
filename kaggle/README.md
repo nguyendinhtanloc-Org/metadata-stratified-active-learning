@@ -18,3 +18,4 @@ Thư mục này chứa toàn bộ các Jupyter Notebook dùng để thực thi c
 5. **05_quick_test.ipynb**: Chạy thử nghiệm mini-batch (1 vòng AL) để kiểm tra luồng huấn luyện trước khi chạy toàn bộ.
 6. **06_unit_tests.ipynb**: Chạy toàn bộ 43/43 unit tests để kiểm tra mã nguồn trước khi huấn luyện.
 7. **07_main_experiment.ipynb**: Notebook thực nghiệm chính — huấn luyện 3 seeds $\times$ 2 pipelines (Baseline vs Stratified) $\times$ 3 rounds, tự động tính kiểm định thống kê và đánh giá domain mAP.
+

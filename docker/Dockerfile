@@ -33,3 +33,4 @@ COPY test/ ./test/
 RUN chmod +x scripts/*.sh
 
 CMD ["bash"]
+

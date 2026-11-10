@@ -8,7 +8,7 @@
 > **Tiểu luận chuyên ngành (Kỹ thuật Dữ liệu)**  
 > **Sinh viên:** Nguyễn Đình Tấn Lộc (MSSV: 23133041)  
 > **Giảng viên hướng dẫn:** TS. Nguyễn Thanh Tuấn  
-> **Đơn vị:** Khoa Công nghệ Thông tin, Trường Đại học Sư phạm Kỹ thuật TP.HCM (HCMUTE)
+> **Đơn vị:** Khoa Công nghệ Thông tin, Trường Đại học Công nghệ Kỹ thuật TP.HCM (HCMUTE)
 
 ---
 
