@@ -21,7 +21,7 @@ Tuy nhiên, các chiến lược chọn mẫu theo độ bất định (*Uncerta
 Dự án này đề xuất giải pháp **Phân tầng theo Metadata vật lý (Metadata Stratification)** kết hợp:
 1. **Lọc khó đa tầng (Hybrid Top-K Filtering):** Chỉ lọc trong tập ảnh có độ không chắc chắn cao nhất.
 2. **Phân bổ Quota Căn bậc hai tần suất ($w_k \propto \sqrt{N_k}$):** Cân bằng Pareto tối ưu giữa tần suất tự nhiên và chia đều.
-3. **Cân bằng biên đa chiều bằng thuật toán Iterative Proportional Fitting (IPF / Sinkhorn):** Giải bài toán ràng buộc biên đồng thời trên 3 trục metadata (`weather`, `scene`, `timeofday`) với sai số $L_1 \approx 0$.
+3. **Cân bằng biên đa chiều bằng thuật toán Iterative Proportional Fitting (IPF / Sinkhorn):** Giải bài toán ràng buộc biên đồng thời trên 3 trục metadata (`weather`, `scene`, `timeofday`). Do cơ chế Capacity-Constrained (trọng số cell bị chặn trần ở số ảnh thực có của cell), sai số biên (L1) không thể luôn bằng 0; cấu hình Sqrt (đề xuất) đạt $L_1 \le 4$ còn Inverse/Equal vọt lên $L_1 = 122–276$ (quota mục tiêu vượt sức chứa stratum hiếm) — xem Mục 6 của `report/BAO_CAO_TIEN_DO_TLCN.md`.
 
 ---
 
@@ -34,8 +34,10 @@ Thực nghiệm được tiến hành trên tập **BDD100K**, so sánh giữa *
 | **Entropy Batch Round 1** | $3.8366 \pm 0.0353$ bits | **$5.2031 \pm 0.0494$ bits** | $t = 36.26, p = 0.00076$, Cohen's $d = 20.93$ | **Bác bỏ $H_0$ ($p < 0.001$)** |
 | **Entropy Batch Round 2** | $3.7010 \pm 0.0909$ bits | **$5.0640 \pm 0.0605$ bits** | $t = 16.82, p = 0.00352$, Cohen's $d = 9.71$ | **Bác bỏ $H_0$ ($p < 0.005$)** |
 | **Domain `adverse_weather` $\text{mAP}_{50}$** | $0.3223 \pm 0.0055$ | **$0.3430 \pm 0.0147$** | **$+0.0208$ ($+2.08\%$)** | Vượt Baseline ở mọi seed |
-| **Domain `adverse_weather` $\text{mAP}_{50\text{--}95}$** | $0.1753 \pm 0.0032$ | **$0.1910 \pm 0.0087$** | **$+0.0157$ ($+1.57\%$)** | Cải thiện độ siết bounding box |
+| **Overall $\text{mAP}_{50\text{--}95}$ (Round 2, toàn tập kiểm tra 2000 ảnh)** | $0.2026 \pm 0.0019$ | $0.1958 \pm 0.0043$ | $-0.0068$ ($-3.4\%$) | Chi phí của việc đa dạng hóa metadata trên IoU khắt khe (trade-off, xem Mục 4.2) |
 | **Overall $\text{mAP}_{50}$ (Round 2)** | $0.3775 \pm 0.0009$ | $0.3655 \pm 0.0062$ | $-0.0120$ (Đánh đổi mật độ nhãn) | Trade-off an toàn miền hiếm |
+
+**Ablation quota mode (seed 42, cùng giao thức)** — Sqrt đạt entropy cao nhất 5 cấu hình ($5.1261$ bits, $+39.8\%$) với suy giảm mAP toàn cục nhỏ nhất trong nhóm stratified, đồng thời dẫn đầu miền `adverse_weather` ($0.334$) — xem `results/ablation/ablation_quota_summary.csv` và Mục 6 của báo cáo.
 
 ---
 
