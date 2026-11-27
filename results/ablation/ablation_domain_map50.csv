@@ -1,0 +1,5 @@
+domain,abl_equal_seed42,abl_inverse_seed42,abl_proportional_seed42
+adverse_weather,0.3107,0.3218,0.3317
+daytime_ctrl,0.3667,0.3648,0.3709
+night,0.3477,0.3580,0.3843
+rare_scenes,0.3899,0.4062,0.3672
