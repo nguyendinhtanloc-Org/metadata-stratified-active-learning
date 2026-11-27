@@ -1,0 +1,6 @@
+config,quota_mode,quota_scope,hybrid_top_k,entropy_r2,overall_map50_r2,overall_map50_95_r2,val_map50_r2,quota_l1_r2
+baseline,none,none,0,3.6695,0.3786,0.2033,0.4728,n/a
+abl_proportional_seed42,proportional,joint,0,4.7596,0.3652,0.1960,0.4351,n/a
+abl_equal_seed42,equal,per_field,3,5.0527,0.3572,0.1902,0.4170,weather 122 / scene 46 / timeofday 106
+abl_inverse_seed42,inverse,per_field,3,5.0586,0.3607,0.1902,0.3900,weather 276 / scene 40 / timeofday 276
+stratified_seed42 (sqrt, main),sqrt,per_field,3,5.1261,0.3596,0.1908,0.4398,weather 0 / scene 4 / timeofday 2
